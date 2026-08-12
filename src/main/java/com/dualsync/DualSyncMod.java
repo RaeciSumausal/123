@@ -6,7 +6,6 @@ import com.mojang.brigadier.arguments.StringArgumentType;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
-import net.fabricmc.fabric.api.entity.event.v1.ServerPlayerEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.minecraft.block.BlockState;
 import net.minecraft.network.packet.s2c.play.PositionFlag;
@@ -41,12 +40,12 @@ public class DualSyncMod implements ModInitializer {
     private static UUID p1UUID = null; // 主世界玩家
     private static UUID p2UUID = null; // 下界玩家
 
-    // 设置的起跑坐标
+    // 起跑坐标
     private static Vec3d overworldSpawn = null;
     private static Vec3d netherSpawn = null;
     private static boolean customSpawnSet = false;
 
-    // 上一帧位置记录 (增量同步)
+    // 上一帧基准坐标
     private static Vec3d p1LastPos = null;
     private static Vec3d p2LastPos = null;
 
@@ -67,12 +66,6 @@ public class DualSyncMod implements ModInitializer {
                 if (player.getUuid().equals(p1UUID) || player.getUuid().equals(p2UUID)) {
                     onPlayerDeath(player.getServer());
                 }
-            }
-        });
-
-        ServerPlayerEvents.AFTER_RESPAWN.register((oldPlayer, newPlayer, alive) -> {
-            if (gameActive && (newPlayer.getUuid().equals(p1UUID) || newPlayer.getUuid().equals(p2UUID))) {
-                checkAndPerformReset(newPlayer.getServer());
             }
         });
     }
@@ -107,7 +100,7 @@ public class DualSyncMod implements ModInitializer {
                     overworldSpawn = null;
                     netherSpawn = null;
                     customSpawnSet = false;
-                    ctx.getSource().sendFeedback(() -> Text.literal("§e[DualSync] 已清空起跑坐标，启动前请重新设置！"), true);
+                    ctx.getSource().sendFeedback(() -> Text.literal("§e[DualSync] 已清空起跑坐标！"), true);
                     return 1;
                 }))
 
@@ -116,7 +109,7 @@ public class DualSyncMod implements ModInitializer {
                 .then(CommandManager.argument("p2", StringArgumentType.string())
                 .executes(ctx -> {
                     if (!customSpawnSet || overworldSpawn == null || netherSpawn == null) {
-                        ctx.getSource().sendError(Text.literal("§c[DualSync] 错误：尚未设置坐标！请先使用 /dualsync setspawn <x> <owY> <netherY> <z> 设置。"));
+                        ctx.getSource().sendError(Text.literal("§c[DualSync] 错误：尚未设置坐标！请先使用 /dualsync setspawn 设置。"));
                         return 0;
                     }
 
@@ -179,16 +172,24 @@ public class DualSyncMod implements ModInitializer {
     }
 
     private void onServerTick(MinecraftServer server) {
-        if (!gameActive || needsReset) return;
+        if (!gameActive) return;
 
         ServerPlayerEntity p1 = server.getPlayerManager().getPlayer(p1UUID);
         ServerPlayerEntity p2 = server.getPlayerManager().getPlayer(p2UUID);
 
-        if (p1 == null || p2 == null || p1.isDead() || p2.isDead()) {
+        if (p1 == null || p2 == null) return;
+
+        // 处理死亡后的安全复活重置（解决主世界死亡复活传送位置偏差问题）
+        if (needsReset) {
+            if (!p1.isDead() && !p2.isDead() && p1.isAlive() && p2.isAlive()) {
+                executeReset(server, p1, p2);
+            }
             return;
         }
 
-        // 维度跨越检测（胜利）
+        if (p1.isDead() || p2.isDead()) return;
+
+        // 维度跨越检测（胜利条件）
         boolean p1Crossed = !p1.getWorld().getRegistryKey().equals(p1StartDimension);
         boolean p2Crossed = !p2.getWorld().getRegistryKey().equals(p2StartDimension);
 
@@ -200,69 +201,58 @@ public class DualSyncMod implements ModInitializer {
         Vec3d p1Cur = p1.getPos();
         Vec3d p2Cur = p2.getPos();
 
-        // 1. 计算双方本 Tick 的位移增量
+        // 1. 计算增量位移
         double d1X = p1Cur.x - p1LastPos.x;
         double d1Z = p1Cur.z - p1LastPos.z;
 
         double d2X = p2Cur.x - p2LastPos.x;
         double d2Z = p2Cur.z - p2LastPos.z;
 
-        double totalDX = d1X + d2X;
-        double totalDZ = d1Z + d2Z;
+        double targetDX = d1X + d2X;
+        double targetDZ = d1Z + d2Z;
 
-        // 2. 轴向拆分碰撞检测（支持沿墙滑动，彻底解决穿墙与强行突破限制）
-        double validDX = 0;
-        if (Math.abs(totalDX) > 0.0001) {
-            double testP1X = p1LastPos.x + totalDX;
-            double testP2X = p2LastPos.x + totalDX;
-
-            // 只有当主世界与下界在 X 轴上均无墙壁阻挡时，才允许 X 轴移动
-            if (canPlayerMoveTo(p1, testP1X, p1LastPos.z) && canPlayerMoveTo(p2, testP2X, p2LastPos.z)) {
-                validDX = totalDX;
+        // 2. 轴向墙壁碰撞检测
+        double finalDX = 0;
+        if (Math.abs(targetDX) > 0.0001) {
+            if (canPlayerMoveTo(p1, p1LastPos.x + targetDX, p1LastPos.z) &&
+                canPlayerMoveTo(p2, p2LastPos.x + targetDX, p2LastPos.z)) {
+                finalDX = targetDX;
             }
         }
 
-        double validDZ = 0;
-        if (Math.abs(totalDZ) > 0.0001) {
-            double testP1Z = p1LastPos.z + totalDZ;
-            double testP2Z = p2LastPos.z + totalDZ;
-
-            // 只有当主世界与下界在 Z 轴上均无墙壁阻挡时，才允许 Z 轴移动
-            if (canPlayerMoveTo(p1, p1LastPos.x + validDX, testP1Z) && canPlayerMoveTo(p2, p2LastPos.x + validDX, testP2Z)) {
-                validDZ = totalDZ;
+        double finalDZ = 0;
+        if (Math.abs(targetDZ) > 0.0001) {
+            if (canPlayerMoveTo(p1, p1LastPos.x + finalDX, p1LastPos.z + targetDZ) &&
+                canPlayerMoveTo(p2, p2LastPos.x + finalDX, p2LastPos.z + targetDZ)) {
+                finalDZ = targetDZ;
             }
         }
 
-        // 3. 计算最终合法的移动目标点
-        double finalP1X = p1LastPos.x + validDX;
-        double finalP1Z = p1LastPos.z + validDZ;
+        double targetP1X = p1LastPos.x + finalDX;
+        double targetP1Z = p1LastPos.z + finalDZ;
 
-        double finalP2X = p2LastPos.x + validDX;
-        double finalP2Z = p2LastPos.z + validDZ;
+        double targetP2X = p2LastPos.x + finalDX;
+        double targetP2Z = p2LastPos.z + finalDZ;
 
-        // 4. 应用垂直重力与地面检测同步
-        syncPlayerWithGravity(p1, finalP1X, finalP1Z);
-        syncPlayerWithGravity(p2, finalP2X, finalP2Z);
+        // 3. 智能传送应用：只有需要修正位置或计算垂直重力时才发传送包，彻底消除移动极慢/卡顿
+        syncPlayerSmartly(p1, targetP1X, targetP1Z, p1Cur);
+        syncPlayerSmartly(p2, targetP2X, targetP2Z, p2Cur);
 
         p1LastPos = p1.getPos();
         p2LastPos = p2.getPos();
     }
 
-    // 核心碰撞检测：判断玩家在目标 (X, Z) 处是否会撞墙
+    // 精准实体墙壁碰撞检测：只检测 torso~head 高度（避开半砖、台阶与脚下）
     private boolean canPlayerMoveTo(ServerPlayerEntity player, double targetX, double targetZ) {
         ServerWorld world = player.getServerWorld();
         double currentY = player.getY();
 
-        // 玩家碰撞箱半宽 0.29（保留 0.01 边缘余量避免浮点数计算误差导致的误判）
-        double halfWidth = 0.29;
-        // 高度区间从 currentY + 0.51 开始：自动避开半砖/台阶/楼梯等 0.5 格高度可自动跨越的方块
-        // 专门精准检测 1 格及以上的实体墙壁与栅栏
-        double minY = currentY + 0.51;
+        double halfWidth = 0.28;
+        // 避开 0.5 格高可自动跨越的台阶，只检测 1 格及以上实体墙壁
+        double minY = currentY + 0.55;
         double maxY = currentY + player.getHeight() - 0.1;
 
-        if (maxY <= minY) {
-            maxY = minY + 0.1;
-        }
+        if (maxY <= minY) maxY = minY + 0.1;
 
         Box testBox = new Box(
             targetX - halfWidth, minY, targetZ - halfWidth,
@@ -272,22 +262,41 @@ public class DualSyncMod implements ModInitializer {
         return world.isSpaceEmpty(player, testBox);
     }
 
-    private void syncPlayerWithGravity(ServerPlayerEntity player, double targetX, double targetZ) {
+    // 智能同步：正常移动时不干扰客户端，悬空时引入重力与下落伤害
+    private void syncPlayerSmartly(ServerPlayerEntity player, double targetX, double targetZ, Vec3d currentPos) {
         ServerWorld world = player.getServerWorld();
         double currentY = player.getY();
-        Vec3d vel = player.getVelocity();
 
-        // 真实的碰撞箱地面判定（下探 0.05 格）
+        // 地面检测
         Box checkGroundBox = new Box(
             targetX - 0.29, currentY - 0.05, targetZ - 0.29,
             targetX + 0.29, currentY,        targetZ + 0.29
         );
         boolean hasGround = !world.isSpaceEmpty(player, checkGroundBox);
 
-        double finalY = currentY;
+        // 判断水平位置是否已经吻合（允许 0.001 误差）
+        boolean posMatches = Math.hypot(targetX - currentPos.x, targetZ - currentPos.z) < 0.001;
 
-        if (!hasGround) {
-            // 自由落体
+        if (hasGround) {
+            // 在地面上：结算先前积攒的下落伤害
+            if (player.fallDistance > 3.0f) {
+                float damageAmount = (float) Math.ceil(player.fallDistance - 3.0f);
+                player.damage(world.getDamageSources().fall(), damageAmount);
+            }
+            player.fallDistance = 0.0f;
+            player.setOnGround(true);
+
+            // 核心关键：若玩家自发 WASD 移动且没有被阻挡，不发送 requestTeleport，保持原生流畅体验！
+            if (!posMatches) {
+                player.networkHandler.requestTeleport(
+                    targetX, currentY, targetZ,
+                    player.getYaw(), player.getPitch(),
+                    EnumSet.of(PositionFlag.X_ROT, PositionFlag.Y_ROT)
+                );
+            }
+        } else {
+            // 处于悬空状态：计算重力落体
+            Vec3d vel = player.getVelocity();
             double newVelY = Math.max((vel.y - 0.08) * 0.98, -3.92);
             double nextY = currentY + newVelY;
 
@@ -296,6 +305,7 @@ public class DualSyncMod implements ModInitializer {
                 targetX + 0.29, currentY, targetZ + 0.29
             );
 
+            double finalY = nextY;
             if (!world.isSpaceEmpty(player, landBox)) {
                 // 着地碰撞计算
                 BlockPos landPos = BlockPos.ofFloored(targetX, nextY, targetZ);
@@ -310,41 +320,28 @@ public class DualSyncMod implements ModInitializer {
                 }
                 finalY = blockTopY;
 
-                // 结算下落伤害
                 player.fallDistance += (float) Math.max(0, currentY - finalY);
                 if (player.fallDistance > 3.0f) {
                     float damageAmount = (float) Math.ceil(player.fallDistance - 3.0f);
                     player.damage(world.getDamageSources().fall(), damageAmount);
                 }
-
                 player.fallDistance = 0.0f;
                 player.setVelocity(vel.x, 0, vel.z);
                 player.setOnGround(true);
             } else {
                 player.fallDistance += (float) Math.max(0, currentY - nextY);
-                finalY = nextY;
                 player.setVelocity(vel.x, newVelY, vel.z);
                 player.velocityModified = true;
                 player.setOnGround(false);
             }
-        } else {
-            if (player.fallDistance > 3.0f) {
-                float damageAmount = (float) Math.ceil(player.fallDistance - 3.0f);
-                player.damage(world.getDamageSources().fall(), damageAmount);
-            }
-            player.fallDistance = 0.0f;
-            player.setOnGround(true);
-        }
 
-        // 强制位置传送，保持视角独立
-        player.networkHandler.requestTeleport(
-            targetX,
-            finalY,
-            targetZ,
-            player.getYaw(),
-            player.getPitch(),
-            EnumSet.of(PositionFlag.X_ROT, PositionFlag.Y_ROT)
-        );
+            // 悬空时同步下落位移
+            player.networkHandler.requestTeleport(
+                targetX, finalY, targetZ,
+                player.getYaw(), player.getPitch(),
+                EnumSet.of(PositionFlag.X_ROT, PositionFlag.Y_ROT)
+            );
+        }
     }
 
     private void onPlayerDeath(MinecraftServer server) {
@@ -359,37 +356,32 @@ public class DualSyncMod implements ModInitializer {
         if (p2 != null) sendTitleAndSound(p2, "§c§l触发重置", "§7检测到玩家阵亡，正在重新开始...", SoundEvents.ENTITY_WITHER_DEATH);
     }
 
-    private void checkAndPerformReset(MinecraftServer server) {
-        if (!gameActive || !needsReset) return;
+    // 严谨安全的复活重置处理
+    private void executeReset(MinecraftServer server, ServerPlayerEntity p1, ServerPlayerEntity p2) {
+        ServerWorld overworld = server.getWorld(World.OVERWORLD);
+        ServerWorld nether = server.getWorld(World.NETHER);
 
-        ServerPlayerEntity p1 = server.getPlayerManager().getPlayer(p1UUID);
-        ServerPlayerEntity p2 = server.getPlayerManager().getPlayer(p2UUID);
+        p1.teleport(overworld, overworldSpawn.x, overworldSpawn.y, overworldSpawn.z, p1.getYaw(), p1.getPitch());
+        p2.teleport(nether, netherSpawn.x, netherSpawn.y, netherSpawn.z, p2.getYaw(), p2.getPitch());
 
-        if (p1 != null && p2 != null && !p1.isDead() && !p2.isDead()) {
-            ServerWorld overworld = server.getWorld(World.OVERWORLD);
-            ServerWorld nether = server.getWorld(World.NETHER);
+        p1.setVelocity(Vec3d.ZERO);
+        p2.setVelocity(Vec3d.ZERO);
+        p1.fallDistance = 0;
+        p2.fallDistance = 0;
 
-            p1.teleport(overworld, overworldSpawn.x, overworldSpawn.y, overworldSpawn.z, p1.getYaw(), p1.getPitch());
-            p2.teleport(nether, netherSpawn.x, netherSpawn.y, netherSpawn.z, p2.getYaw(), p2.getPitch());
+        p1.setHealth(p1.getMaxHealth());
+        p2.setHealth(p2.getMaxHealth());
+        p1.getHungerManager().setFoodLevel(20);
+        p2.getHungerManager().setFoodLevel(20);
 
-            p1.setVelocity(Vec3d.ZERO);
-            p2.setVelocity(Vec3d.ZERO);
-            p1.fallDistance = 0;
-            p2.fallDistance = 0;
+        // 重置位移参考点
+        p1LastPos = overworldSpawn;
+        p2LastPos = netherSpawn;
 
-            p1.setHealth(p1.getMaxHealth());
-            p2.setHealth(p2.getMaxHealth());
-            p1.getHungerManager().setFoodLevel(20);
-            p2.getHungerManager().setFoodLevel(20);
+        needsReset = false;
 
-            p1LastPos = overworldSpawn;
-            p2LastPos = netherSpawn;
-
-            needsReset = false;
-
-            sendTitleAndSound(p1, "§e§l重新开始！", "§7已重置到起点，保持步调一致！", SoundEvents.ENTITY_PLAYER_LEVELUP);
-            sendTitleAndSound(p2, "§e§l重新开始！", "§7已重置到起点，保持步调一致！", SoundEvents.ENTITY_PLAYER_LEVELUP);
-        }
+        sendTitleAndSound(p1, "§e§l重新开始！", "§7已重置到起点，保持步调一致！", SoundEvents.ENTITY_PLAYER_LEVELUP);
+        sendTitleAndSound(p2, "§e§l重新开始！", "§7已重置到起点，保持步调一致！", SoundEvents.ENTITY_PLAYER_LEVELUP);
     }
 
     private void triggerVictory(MinecraftServer server, ServerPlayerEntity p1, ServerPlayerEntity p2) {
