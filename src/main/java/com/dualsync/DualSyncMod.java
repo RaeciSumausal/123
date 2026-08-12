@@ -230,7 +230,7 @@ public class DualSyncMod implements ModInitializer {
         double targetP2X = p2LastPos.x + finalDX;
         double targetP2Z = p2LastPos.z + finalDZ;
 
-        // 3. 修正水平同步：传入玩家真正的实际 Y 坐标，绝不上锁或重置高度
+        // 3. 水平位置同步
         syncHorizontalPosition(p1, targetP1X, targetP1Z, p1Cur);
         syncHorizontalPosition(p2, targetP2X, targetP2Z, p2Cur);
 
@@ -257,19 +257,21 @@ public class DualSyncMod implements ModInitializer {
         return world.isSpaceEmpty(player, testBox);
     }
 
-    // 修复后的同步逻辑：使用 player.getY() 维持绝对高度，仅旋转属性使用相对增量
+    // 终极视角与坐标同步：使用玩家真实视角 + 空 Flag 集合，彻底解决 0 0 视角重置问题
     private void syncHorizontalPosition(ServerPlayerEntity player, double targetX, double targetZ, Vec3d currentPos) {
-        double distSq = (targetX - currentPos.x) * (targetX - currentPos.x) + (targetZ - currentPos.z) * (targetZ - currentPos.z);
+        double dx = targetX - currentPos.x;
+        double dz = targetZ - currentPos.z;
+        double distSq = dx * dx + dz * dz;
 
-        // 仅在被墙体限制或增量偏差时同步
-        if (distSq > 0.000001) {
+        // 仅在水平位置偏差大于 0.0001 (约 1 厘米) 时进行强行修正，消除浮点误差并防止高频封包轰炸
+        if (distSq > 0.0001) {
             player.networkHandler.requestTeleport(
                 targetX,
-                player.getY(), // 关键修复：使用玩家当前真实的 Y 坐标！
+                player.getY(),                      // 保持玩家当前真实的 Y 坐标（不干扰重力下落与跳跃）
                 targetZ,
-                0.0f,          // 视角增量 0
-                0.0f,          // 视角增量 0
-                EnumSet.of(PositionFlag.X_ROT, PositionFlag.Y_ROT) // 仅旋转使用相对模式
+                player.getYaw(),                    // 读取服务端当前记录的玩家真实 Yaw 视角
+                player.getPitch(),                  // 读取服务端当前记录的玩家真实 Pitch 视角
+                EnumSet.noneOf(PositionFlag.class)  // 使用绝对坐标传输，彻底废弃易引发客户端位掩码 Bug 的相对 Flag
             );
         }
     }
