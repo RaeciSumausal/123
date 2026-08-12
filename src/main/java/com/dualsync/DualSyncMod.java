@@ -22,7 +22,6 @@ import net.minecraft.sound.SoundCategory;
 import net.minecraft.sound.SoundEvent;
 import net.minecraft.sound.SoundEvents;
 import net.minecraft.text.Text;
-import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.World;
 
@@ -31,8 +30,9 @@ import java.util.UUID;
 
 public class DualSyncMod implements ModInitializer {
 
-    // 游戏运行状态
     private static boolean gameActive = false;
+    private static boolean needsReset = false; // 死亡等待重置标记，防止复活时间差导致位移错误
+
     private static UUID p1UUID = null; // 主世界玩家
     private static UUID p2UUID = null; // 下界玩家
 
@@ -56,10 +56,10 @@ public class DualSyncMod implements ModInitializer {
             registerCommands(dispatcher);
         });
 
-        // 2. 注册主循环 Tick (同步坐标与胜利判定)
+        // 2. 注册主循环 Tick
         ServerTickEvents.END_SERVER_TICK.register(this::onServerTick);
 
-        // 3. 注册死亡监听 (触发重置音效与视觉)
+        // 3. 注册死亡监听
         ServerLivingEntityEvents.AFTER_DEATH.register((entity, damageSource) -> {
             if (gameActive && entity instanceof ServerPlayerEntity player) {
                 if (player.getUuid().equals(p1UUID) || player.getUuid().equals(p2UUID)) {
@@ -68,10 +68,10 @@ public class DualSyncMod implements ModInitializer {
             }
         });
 
-        // 4. 注册复活监听 (精准回溯下界/主世界起跑点并恢复同步)
+        // 4. 注册复活监听 (必须等待双方均复活后再同步)
         ServerPlayerEvents.AFTER_RESPAWN.register((oldPlayer, newPlayer, alive) -> {
             if (gameActive && (newPlayer.getUuid().equals(p1UUID) || newPlayer.getUuid().equals(p2UUID))) {
-                onPlayerRespawn(newPlayer.getServer());
+                checkAndPerformReset(newPlayer.getServer());
             }
         });
     }
@@ -80,7 +80,6 @@ public class DualSyncMod implements ModInitializer {
         dispatcher.register(CommandManager.literal("dualsync")
             .requires(source -> source.hasPermissionLevel(2))
 
-            // 指令 1: 手动设置起跑坐标
             .then(CommandManager.literal("setspawn")
                 .then(CommandManager.argument("x", DoubleArgumentType.doubleArg())
                 .then(CommandManager.argument("owY", DoubleArgumentType.doubleArg())
@@ -102,7 +101,6 @@ public class DualSyncMod implements ModInitializer {
                     return 1;
                 }))))))
 
-            // 指令 2: 清空坐标
             .then(CommandManager.literal("clearspawn")
                 .executes(ctx -> {
                     overworldSpawn = null;
@@ -112,12 +110,10 @@ public class DualSyncMod implements ModInitializer {
                     return 1;
                 }))
 
-            // 指令 3: 开启游戏
             .then(CommandManager.literal("start")
                 .then(CommandManager.argument("p1", StringArgumentType.string())
                 .then(CommandManager.argument("p2", StringArgumentType.string())
                 .executes(ctx -> {
-                    // 问题 1 修复：未设置坐标时不再自动寻找，提示必须手动设置
                     if (!customSpawnSet || overworldSpawn == null || netherSpawn == null) {
                         ctx.getSource().sendError(Text.literal("§c[DualSync] 错误：尚未设置坐标！请先使用 /dualsync setspawn <x> <owY> <netherY> <z> 设置。"));
                         return 0;
@@ -139,7 +135,6 @@ public class DualSyncMod implements ModInitializer {
                     return 1;
                 }))))
 
-            // 指令 4: 终止游戏
             .then(CommandManager.literal("stop")
                 .executes(ctx -> {
                     if (!gameActive) {
@@ -163,13 +158,13 @@ public class DualSyncMod implements ModInitializer {
         p1.teleport(overworld, overworldSpawn.x, overworldSpawn.y, overworldSpawn.z, p1.getYaw(), p1.getPitch());
         p2.teleport(nether, netherSpawn.x, netherSpawn.y, netherSpawn.z, p2.getYaw(), p2.getPitch());
 
-        // 问题 3 修复：直接锚定设置的坐标，确保 100% 精确
         p1StartPos = overworldSpawn;
         p2StartPos = netherSpawn;
 
         p1StartDimension = World.OVERWORLD;
         p2StartDimension = World.NETHER;
 
+        needsReset = false;
         gameActive = true;
 
         sendTitleAndSound(p1, "§a§l双界同步 · 开始", "§7保持同步，跨越维度！", SoundEvents.UI_TOAST_CHALLENGE_COMPLETE);
@@ -179,7 +174,8 @@ public class DualSyncMod implements ModInitializer {
     }
 
     private void onServerTick(MinecraftServer server) {
-        if (!gameActive) return;
+        // 如果游戏未开启或处于重置等待期间，暂停同步计算
+        if (!gameActive || needsReset) return;
 
         ServerPlayerEntity p1 = server.getPlayerManager().getPlayer(p1UUID);
         ServerPlayerEntity p2 = server.getPlayerManager().getPlayer(p2UUID);
@@ -188,7 +184,7 @@ public class DualSyncMod implements ModInitializer {
             return;
         }
 
-        // 维度跨越检测
+        // 维度跨越检测（胜利条件）
         boolean p1Crossed = !p1.getWorld().getRegistryKey().equals(p1StartDimension);
         boolean p2Crossed = !p2.getWorld().getRegistryKey().equals(p2StartDimension);
 
@@ -197,99 +193,80 @@ public class DualSyncMod implements ModInitializer {
             return;
         }
 
-        // 计算 P1 位移并应用给 P2
-        Vec3d delta1 = p1.getPos().subtract(p1StartPos);
-        double targetX = p2StartPos.x + delta1.x;
-        double targetY = p2StartPos.y + delta1.y;
-        double targetZ = p2StartPos.z + delta1.z;
+        // 1. 计算 P1 在 X/Z 水平面上的相对位移
+        double deltaX = p1.getX() - p1StartPos.x;
+        double deltaZ = p1.getZ() - p1StartPos.z;
 
-        // 问题 4 修复：平滑移动、防穿墙、不卡视角、空中下落
-        syncP2Position(p2, targetX, targetY, targetZ);
-    }
+        // 2. 下界玩家的目标水平坐标
+        double targetX = p2StartPos.x + deltaX;
+        double targetZ = p2StartPos.z + deltaZ;
 
-    private void syncP2Position(ServerPlayerEntity p2, double targetX, double targetY, double targetZ) {
-        ServerWorld world = p2.getServerWorld();
+        // 3. 计算与上一帧的偏差
+        double currentDx = targetX - p2.getX();
+        double currentDz = targetZ - p2.getZ();
+        double distSq = currentDx * currentDx + currentDz * currentDz;
 
-        // 1. 防穿墙检测
-        BlockPos feetPos = BlockPos.ofFloored(targetX, targetY + 0.1, targetZ);
-        BlockPos headPos = BlockPos.ofFloored(targetX, targetY + 1.5, targetZ);
-
-        boolean feetInWall = world.getBlockState(feetPos).isOpaqueFullCube(world, feetPos);
-        boolean headInWall = world.getBlockState(headPos).isOpaqueFullCube(world, headPos);
-
-        double finalX = targetX;
-        double finalY = targetY;
-        double finalZ = targetZ;
-
-        if (feetInWall || headInWall) {
-            // 如果前方是墙，限制 X/Z 轴盲目穿墙
-            finalX = p2.getX();
-            finalZ = p2.getZ();
+        // 解决问题 1：仅在 P1 真正发生 X/Z 移动时才发包更新，防止频繁发包挤掉 UI 和操作
+        if (distSq > 0.0001) {
+            // 解决问题 2：传参使用 p2.getY()，完全把 Y 轴交给原版重力、跳跃和落体物理
+            p2.networkHandler.requestTeleport(
+                targetX,
+                p2.getY(), 
+                targetZ,
+                0,
+                0,
+                EnumSet.of(PositionFlag.X_ROT, PositionFlag.Y_ROT) // 保持 P2 视角可自由旋转
+            );
         }
-
-        // 2. 空中下落检测（解决空中悬浮问题）
-        BlockPos groundCheck = BlockPos.ofFloored(finalX, finalY - 0.1, finalZ);
-        boolean isAirBelow = world.getBlockState(groundCheck).isAir();
-
-        if (isAirBelow && !p2.isOnGround()) {
-            // 如果脚下是空气，保留自由下落 Y 轴，不强制锁定高度
-            if (p2.getY() < finalY) {
-                finalY = p2.getY();
-            }
-        }
-
-        // 3. 使用 Relative Rotation Flags 传送，彻底解放视角控制
-        p2.networkHandler.requestTeleport(
-            finalX, 
-            finalY, 
-            finalZ, 
-            0, 
-            0, 
-            EnumSet.of(PositionFlag.X_ROT, PositionFlag.Y_ROT)
-        );
     }
 
     private void onPlayerDeath(MinecraftServer server) {
-        if (!gameActive) return;
+        if (!gameActive || needsReset) return;
+
+        // 标记需要重置，此时在两人均复活之前，tick 内的坐标同步会被冻结
+        needsReset = true; 
 
         ServerPlayerEntity p1 = server.getPlayerManager().getPlayer(p1UUID);
         ServerPlayerEntity p2 = server.getPlayerManager().getPlayer(p2UUID);
 
-        // 问题 2 修复：不再提示“挑战失败”，改为“触发重置”
         if (p1 != null) sendTitleAndSound(p1, "§c§l触发重置", "§7检测到玩家阵亡，正在重新开始...", SoundEvents.ENTITY_WITHER_DEATH);
         if (p2 != null) sendTitleAndSound(p2, "§c§l触发重置", "§7检测到玩家阵亡，正在重新开始...", SoundEvents.ENTITY_WITHER_DEATH);
     }
 
-    private void onPlayerRespawn(MinecraftServer server) {
-        if (!gameActive) return;
+    private void checkAndPerformReset(MinecraftServer server) {
+        if (!gameActive || !needsReset) return;
 
         ServerPlayerEntity p1 = server.getPlayerManager().getPlayer(p1UUID);
         ServerPlayerEntity p2 = server.getPlayerManager().getPlayer(p2UUID);
 
-        if (p1 == null || p2 == null) return;
+        // 解决问题 3：只有当两个人均从死亡界面点击复活、且在服内存活时，才精准执行一次统一传送重置
+        if (p1 != null && p2 != null && !p1.isDead() && !p2.isDead()) {
+            ServerWorld overworld = server.getWorld(World.OVERWORLD);
+            ServerWorld nether = server.getWorld(World.NETHER);
 
-        ServerWorld overworld = server.getWorld(World.OVERWORLD);
-        ServerWorld nether = server.getWorld(World.NETHER);
+            p1.teleport(overworld, overworldSpawn.x, overworldSpawn.y, overworldSpawn.z, p1.getYaw(), p1.getPitch());
+            p2.teleport(nether, netherSpawn.x, netherSpawn.y, netherSpawn.z, p2.getYaw(), p2.getPitch());
 
-        // 问题 3 修复：复活时强行送回精确起跑点
-        p1.teleport(overworld, overworldSpawn.x, overworldSpawn.y, overworldSpawn.z, p1.getYaw(), p1.getPitch());
-        p2.teleport(nether, netherSpawn.x, netherSpawn.y, netherSpawn.z, p2.getYaw(), p2.getPitch());
+            p1.setHealth(p1.getMaxHealth());
+            p2.setHealth(p2.getMaxHealth());
+            p1.getHungerManager().setFoodLevel(20);
+            p2.getHungerManager().setFoodLevel(20);
 
-        p1.setHealth(p1.getMaxHealth());
-        p2.setHealth(p2.getMaxHealth());
-        p1.getHungerManager().setFoodLevel(20);
-        p2.getHungerManager().setFoodLevel(20);
+            // 重新刷新准确的基准坐标
+            p1StartPos = p1.getPos();
+            p2StartPos = p2.getPos();
 
-        // 重新锚定起点基准
-        p1StartPos = overworldSpawn;
-        p2StartPos = netherSpawn;
+            // 恢复同步功能
+            needsReset = false;
 
-        sendTitleAndSound(p1, "§e§l重新开始！", "§7已重置到起点，保持步调一致！", SoundEvents.ENTITY_PLAYER_LEVELUP);
-        sendTitleAndSound(p2, "§e§l重新开始！", "§7已重置到起点，保持步调一致！", SoundEvents.ENTITY_PLAYER_LEVELUP);
+            sendTitleAndSound(p1, "§e§l重新开始！", "§7已重置到起点，保持步调一致！", SoundEvents.ENTITY_PLAYER_LEVELUP);
+            sendTitleAndSound(p2, "§e§l重新开始！", "§7已重置到起点，保持步调一致！", SoundEvents.ENTITY_PLAYER_LEVELUP);
+        }
     }
 
     private void triggerVictory(MinecraftServer server, ServerPlayerEntity p1, ServerPlayerEntity p2) {
         gameActive = false;
+        needsReset = false;
 
         sendTitleAndSound(p1, "§6§l🎉 挑战成功！", "§a你们成功打破空间藩篱，完成了双界同步！", SoundEvents.UI_TOAST_CHALLENGE_COMPLETE);
         sendTitleAndSound(p2, "§6§l🎉 挑战成功！", "§a你们成功打破空间藩篱，完成了双界同步！", SoundEvents.UI_TOAST_CHALLENGE_COMPLETE);
@@ -299,6 +276,7 @@ public class DualSyncMod implements ModInitializer {
 
     private void stopGame(MinecraftServer server, String reason) {
         gameActive = false;
+        needsReset = false;
         broadcast(server, "§c[DualSync] 游戏已终止：" + reason);
     }
 
