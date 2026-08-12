@@ -1,4 +1,4 @@
-package net.fabricmc.virtualwall;
+package com.dualsync;
 
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
@@ -11,7 +11,7 @@ import net.minecraft.util.math.Box;
 import java.util.ArrayList;
 import java.util.List;
 
-public class VirtualWallClient implements ClientModInitializer {
+public class DualSyncClient implements ClientModInitializer {
 
     private static DualInput remoteInput = new DualInput();
     private static final List<Box> virtualWallBoxes = new ArrayList<>();
