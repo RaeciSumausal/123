@@ -7,7 +7,6 @@ import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
-import net.minecraft.network.packet.s2c.play.PositionFlag;
 import net.minecraft.network.packet.s2c.play.SubtitleS2CPacket;
 import net.minecraft.network.packet.s2c.play.TitleFadeS2CPacket;
 import net.minecraft.network.packet.s2c.play.TitleS2CPacket;
@@ -25,7 +24,6 @@ import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.World;
 
-import java.util.EnumSet;
 import java.util.UUID;
 
 public class DualSyncMod implements ModInitializer {
@@ -33,7 +31,7 @@ public class DualSyncMod implements ModInitializer {
     private static boolean gameActive = false;
     private static boolean needsReset = false;
 
-    // 核心修复 1：开局/重置保护期，防止起点传送与同步传送冲突导致掉落到 Y=0
+    // 开局 / 重置保护期，给起点传送留出网络握手时间
     private static int warmupTicks = 0;
 
     private static UUID p1UUID = null; // 主世界玩家
@@ -164,8 +162,7 @@ public class DualSyncMod implements ModInitializer {
         needsReset = false;
         gameActive = true;
 
-        // 设置 1 秒 (20 Ticks) 的保护缓冲，等待客户端完成起点传送
-        warmupTicks = 20;
+        warmupTicks = 20; // 20 Ticks 保护期
 
         sendTitleAndSound(p1, "§a§l双界同步 · 开始", "§7保持同步，跨越维度！", SoundEvents.UI_TOAST_CHALLENGE_COMPLETE);
         sendTitleAndSound(p2, "§a§l双界同步 · 开始", "§7保持同步，跨越维度！", SoundEvents.UI_TOAST_CHALLENGE_COMPLETE);
@@ -190,7 +187,7 @@ public class DualSyncMod implements ModInitializer {
 
         if (p1.isDead() || p2.isDead()) return;
 
-        // 保护期内不执行位置纠偏，给客户端网络握手留出时间
+        // 1 秒保护期，等待客户端加载完起点
         if (warmupTicks > 0) {
             warmupTicks--;
             return;
@@ -246,15 +243,16 @@ public class DualSyncMod implements ModInitializer {
         sharedOffsetX = finalOffsetX;
         sharedOffsetZ = finalOffsetZ;
 
-        // 5. 计算目标 X/Z 坐标并优雅同步
+        // 5. 计算目标 X/Z 坐标
         double targetP1X = overworldSpawn.x + sharedOffsetX;
         double targetP1Z = overworldSpawn.z + sharedOffsetZ;
 
         double targetP2X = netherSpawn.x + sharedOffsetX;
         double targetP2Z = netherSpawn.z + sharedOffsetZ;
 
-        syncHorizontalPosition(p1, targetP1X, targetP1Z);
-        syncHorizontalPosition(p2, targetP2X, targetP2Z);
+        // 6. 执行冲量微调平滑同步
+        applySpringSync(p1, targetP1X, targetP1Z, p1.getServerWorld());
+        applySpringSync(p2, targetP2X, targetP2Z, p2.getServerWorld());
     }
 
     private boolean canPlayerMoveTo(ServerPlayerEntity player, double targetX, double targetZ) {
@@ -275,24 +273,29 @@ public class DualSyncMod implements ModInitializer {
         return world.isSpaceEmpty(player, testBox);
     }
 
-    // 核心修复 2：使用精准标志位传送
-    // 只有当偏差超过 0.001 格 (1毫米) 时才发包。主动走路的玩家不会收到包（0拉扯），被拖着的玩家平滑同步，且 Y 轴下落速度 100% 保留！
-    private void syncHorizontalPosition(ServerPlayerEntity player, double targetX, double targetZ) {
-        double dx = targetX - player.getX();
-        double dz = targetZ - player.getZ();
-        double distSq = dx * dx + dz * dz;
+    // 核心微调算法：弹性物理速度注入，不发 Teleport 包，零干扰 Y 轴重力！
+    private void applySpringSync(ServerPlayerEntity player, double targetX, double targetZ, ServerWorld world) {
+        double errX = targetX - player.getX();
+        double errZ = targetZ - player.getZ();
+        double distSq = errX * errX + errZ * errZ;
 
-        if (distSq > 0.001) {
-            // 指定 Y, X_ROT, Y_ROT 为相对模式 (0.0 表示 Y 轴偏移量为 0)
-            // 客户端接收此包时，不仅不会重置 Y 轴下落速度，也不会改动视角，同时能精准修正 X/Z 坐标！
-            player.networkHandler.requestTeleport(
-                targetX,
-                0.0,
-                targetZ,
-                0.0f,
-                0.0f,
-                EnumSet.of(PositionFlag.Y, PositionFlag.X_ROT, PositionFlag.Y_ROT)
-            );
+        // 情况 A：偏差大于 1.2 格 (1.44 sq)，说明卡墙脱节，触发绝对传送（必定传入玩家当前实际 Y 轴！）
+        if (distSq > 1.44) {
+            player.teleport(world, targetX, player.getY(), targetZ, player.getYaw(), player.getPitch());
+            player.setVelocity(Vec3d.ZERO);
+            return;
+        }
+
+        // 情况 B：微小偏差，通过冲量推导平滑对齐
+        if (distSq > 0.0004) { // 偏差大于 2厘米
+            // 比例系数 0.45，提供柔和拉力
+            double boostX = Math.max(-0.35, Math.min(0.35, errX * 0.45));
+            double boostZ = Math.max(-0.35, Math.min(0.35, errZ * 0.45));
+
+            // 保留原生的 Y 轴速度！绝不干预重力和跳跃！
+            Vec3d currentVel = player.getVelocity();
+            player.setVelocity(boostX, currentVel.y, boostZ);
+            player.velocityModified = true; // 强制向客户端发送 EntityVelocityUpdateS2CPacket 封包
         }
     }
 
@@ -329,7 +332,7 @@ public class DualSyncMod implements ModInitializer {
         sharedOffsetZ = 0.0;
 
         needsReset = false;
-        warmupTicks = 20; // 重置时同样开启 1 秒保护期
+        warmupTicks = 20;
 
         sendTitleAndSound(p1, "§e§l重新开始！", "§7已重置到起点，保持步调一致！", SoundEvents.ENTITY_PLAYER_LEVELUP);
         sendTitleAndSound(p2, "§e§l重新开始！", "§7已重置到起点，保持步调一致！", SoundEvents.ENTITY_PLAYER_LEVELUP);
