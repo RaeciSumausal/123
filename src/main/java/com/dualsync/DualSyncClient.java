@@ -4,7 +4,6 @@ import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.fabricmc.fabric.api.networking.v1.PacketByteBufs;
-import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.network.PacketByteBuf;
 import net.minecraft.util.math.Box;
 
@@ -12,50 +11,8 @@ import java.util.ArrayList;
 import java.util.List;
 
 public class DualSyncClient implements ClientModInitializer {
-
     private static DualInput remoteInput = new DualInput();
-    private static final List<Box> virtualWallBoxes = new ArrayList<>();
-
-    @Override
-    public void onInitializeClient() {
-        // 接收对方按键
-        ClientPlayNetworking.registerGlobalReceiver(VirtualWallMod.INPUT_S2C_PACKET, (client, handler, buf, responseSender) -> {
-            DualInput input = DualInput.readFromBuf(buf);
-            client.execute(() -> remoteInput = input);
-        });
-
-        // 接收对方维度的虚拟墙 Collision Boxes
-        ClientPlayNetworking.registerGlobalReceiver(VirtualWallMod.WALL_S2C_PACKET, (client, handler, buf, responseSender) -> {
-            int count = buf.readInt();
-            List<Box> boxes = new ArrayList<>();
-            for (int i = 0; i < count; i++) {
-                boxes.add(new Box(
-                    buf.readDouble(), buf.readDouble(), buf.readDouble(),
-                    buf.readDouble(), buf.readDouble(), buf.readDouble()
-                ));
-            }
-            client.execute(() -> {
-                virtualWallBoxes.clear();
-                virtualWallBoxes.addAll(boxes);
-            });
-        });
-
-        // 每 Tick 将本地按键发给服务端
-        ClientTickEvents.END_CLIENT_TICK.register(client -> {
-            ClientPlayerEntity player = client.player;
-            if (player != null && player.input != null) {
-                PacketByteBuf buf = PacketByteBufs.create();
-                DualInput localInput = new DualInput(
-                    player.input.movementForward,
-                    player.input.movementSideways,
-                    player.input.jumping,
-                    player.input.sneaking
-                );
-                localInput.writeToBuf(buf);
-                ClientPlayNetworking.send(VirtualWallMod.INPUT_C2S_PACKET, buf);
-            }
-        });
-    }
+    private static List<Box> virtualWallBoxes = new ArrayList<>();
 
     public static DualInput getRemoteInput() {
         return remoteInput;
@@ -63,5 +20,55 @@ public class DualSyncClient implements ClientModInitializer {
 
     public static List<Box> getVirtualWallBoxes() {
         return virtualWallBoxes;
+    }
+
+    @Override
+    public void onInitializeClient() {
+        // 接收远程输入包
+        ClientPlayNetworking.registerGlobalReceiver(DualSyncMod.INPUT_S2C_PACKET, (client, handler, buf, responseSender) -> {
+            float forward = buf.readFloat();
+            float sideways = buf.readFloat();
+            boolean jumping = buf.readBoolean();
+            boolean sneaking = buf.readBoolean();
+
+            client.execute(() -> {
+                remoteInput.forward = forward;
+                remoteInput.sideways = sideways;
+                remoteInput.jumping = jumping;
+                remoteInput.sneaking = sneaking;
+            });
+        });
+
+        // 接收隐形墙数据包
+        ClientPlayNetworking.registerGlobalReceiver(DualSyncMod.WALL_S2C_PACKET, (client, handler, buf, responseSender) -> {
+            int count = buf.readInt();
+            List<Box> boxes = new ArrayList<>();
+            for (int i = 0; i < count; i++) {
+                double minX = buf.readDouble();
+                double minY = buf.readDouble();
+                double minZ = buf.readDouble();
+                double maxX = buf.readDouble();
+                double maxY = buf.readDouble();
+                double maxZ = buf.readDouble();
+                boxes.add(new Box(minX, minY, minZ, maxX, maxY, maxZ));
+            }
+
+            client.execute(() -> {
+                virtualWallBoxes = boxes;
+            });
+        });
+
+        // 定时发送本地输入状态给服务端
+        ClientTickEvents.END_CLIENT_TICK.register(client -> {
+            if (client.player != null && client.options != null) {
+                PacketByteBuf buf = PacketByteBufs.create();
+                buf.writeFloat(client.player.input.movementForward);
+                buf.writeFloat(client.player.input.movementSideways);
+                buf.writeBoolean(client.player.input.jumping);
+                buf.writeBoolean(client.player.input.sneaking);
+
+                ClientPlayNetworking.send(DualSyncMod.INPUT_C2S_PACKET, buf);
+            }
+        });
     }
 }
