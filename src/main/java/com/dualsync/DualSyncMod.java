@@ -200,30 +200,76 @@ public class DualSyncMod implements ModInitializer {
         Vec3d p1Cur = p1.getPos();
         Vec3d p2Cur = p2.getPos();
 
-        // 1. 计算增量位移
+        // 1. 计算双方本 Tick 的位移增量
         double d1X = p1Cur.x - p1LastPos.x;
         double d1Z = p1Cur.z - p1LastPos.z;
 
         double d2X = p2Cur.x - p2LastPos.x;
         double d2Z = p2Cur.z - p2LastPos.z;
 
-        // 2. 双向同步位移
-        if (Math.abs(d1X) > 0.0001 || Math.abs(d1Z) > 0.0001) {
-            double targetP2X = p2Cur.x + d1X;
-            double targetP2Z = p2Cur.z + d1Z;
-            syncPlayerWithGravity(p2, targetP2X, targetP2Z);
-            p2Cur = p2.getPos();
+        double totalDX = d1X + d2X;
+        double totalDZ = d1Z + d2Z;
+
+        // 2. 轴向拆分碰撞检测（支持沿墙滑动，彻底解决穿墙与强行突破限制）
+        double validDX = 0;
+        if (Math.abs(totalDX) > 0.0001) {
+            double testP1X = p1LastPos.x + totalDX;
+            double testP2X = p2LastPos.x + totalDX;
+
+            // 只有当主世界与下界在 X 轴上均无墙壁阻挡时，才允许 X 轴移动
+            if (canPlayerMoveTo(p1, testP1X, p1LastPos.z) && canPlayerMoveTo(p2, testP2X, p2LastPos.z)) {
+                validDX = totalDX;
+            }
         }
 
-        if (Math.abs(d2X) > 0.0001 || Math.abs(d2Z) > 0.0001) {
-            double targetP1X = p1Cur.x + d2X;
-            double targetP1Z = p1Cur.z + d2Z;
-            syncPlayerWithGravity(p1, targetP1X, targetP1Z);
-            p1Cur = p1.getPos();
+        double validDZ = 0;
+        if (Math.abs(totalDZ) > 0.0001) {
+            double testP1Z = p1LastPos.z + totalDZ;
+            double testP2Z = p2LastPos.z + totalDZ;
+
+            // 只有当主世界与下界在 Z 轴上均无墙壁阻挡时，才允许 Z 轴移动
+            if (canPlayerMoveTo(p1, p1LastPos.x + validDX, testP1Z) && canPlayerMoveTo(p2, p2LastPos.x + validDX, testP2Z)) {
+                validDZ = totalDZ;
+            }
         }
 
-        p1LastPos = p1Cur;
-        p2LastPos = p2Cur;
+        // 3. 计算最终合法的移动目标点
+        double finalP1X = p1LastPos.x + validDX;
+        double finalP1Z = p1LastPos.z + validDZ;
+
+        double finalP2X = p2LastPos.x + validDX;
+        double finalP2Z = p2LastPos.z + validDZ;
+
+        // 4. 应用垂直重力与地面检测同步
+        syncPlayerWithGravity(p1, finalP1X, finalP1Z);
+        syncPlayerWithGravity(p2, finalP2X, finalP2Z);
+
+        p1LastPos = p1.getPos();
+        p2LastPos = p2.getPos();
+    }
+
+    // 核心碰撞检测：判断玩家在目标 (X, Z) 处是否会撞墙
+    private boolean canPlayerMoveTo(ServerPlayerEntity player, double targetX, double targetZ) {
+        ServerWorld world = player.getServerWorld();
+        double currentY = player.getY();
+
+        // 玩家碰撞箱半宽 0.29（保留 0.01 边缘余量避免浮点数计算误差导致的误判）
+        double halfWidth = 0.29;
+        // 高度区间从 currentY + 0.51 开始：自动避开半砖/台阶/楼梯等 0.5 格高度可自动跨越的方块
+        // 专门精准检测 1 格及以上的实体墙壁与栅栏
+        double minY = currentY + 0.51;
+        double maxY = currentY + player.getHeight() - 0.1;
+
+        if (maxY <= minY) {
+            maxY = minY + 0.1;
+        }
+
+        Box testBox = new Box(
+            targetX - halfWidth, minY, targetZ - halfWidth,
+            targetX + halfWidth, maxY, targetZ + halfWidth
+        );
+
+        return world.isSpaceEmpty(player, testBox);
     }
 
     private void syncPlayerWithGravity(ServerPlayerEntity player, double targetX, double targetZ) {
@@ -231,8 +277,7 @@ public class DualSyncMod implements ModInitializer {
         double currentY = player.getY();
         Vec3d vel = player.getVelocity();
 
-        // 核心修复：使用玩家真实的碰撞箱 (AABB, 0.6x0.6) 向下扩展 0.05 格进行地面判定
-        // 只要碰撞箱有任何边缘踩在方块上（如潜行在边缘、半砖、楼梯等），都视为拥有地面支持
+        // 真实的碰撞箱地面判定（下探 0.05 格）
         Box checkGroundBox = new Box(
             targetX - 0.29, currentY - 0.05, targetZ - 0.29,
             targetX + 0.29, currentY,        targetZ + 0.29
@@ -242,18 +287,17 @@ public class DualSyncMod implements ModInitializer {
         double finalY = currentY;
 
         if (!hasGround) {
-            // 真正完全悬空时：计算重力下落
+            // 自由落体
             double newVelY = Math.max((vel.y - 0.08) * 0.98, -3.92);
             double nextY = currentY + newVelY;
 
-            // 检测下落路径上是否踩到地面
             Box landBox = new Box(
                 targetX - 0.29, nextY, targetZ - 0.29,
                 targetX + 0.29, currentY, targetZ + 0.29
             );
 
             if (!world.isSpaceEmpty(player, landBox)) {
-                // 着地碰撞：精确计算地面最高点 (兼容半砖、地毯等非完整方块)
+                // 着地碰撞计算
                 BlockPos landPos = BlockPos.ofFloored(targetX, nextY, targetZ);
                 BlockState landState = world.getBlockState(landPos);
                 double blockTopY = landPos.getY() + 1.0;
@@ -277,7 +321,6 @@ public class DualSyncMod implements ModInitializer {
                 player.setVelocity(vel.x, 0, vel.z);
                 player.setOnGround(true);
             } else {
-                // 持续自由落体
                 player.fallDistance += (float) Math.max(0, currentY - nextY);
                 finalY = nextY;
                 player.setVelocity(vel.x, newVelY, vel.z);
@@ -285,7 +328,6 @@ public class DualSyncMod implements ModInitializer {
                 player.setOnGround(false);
             }
         } else {
-            // 在地面平移/潜行：若此前悬空积攒了下落高度，结算摔落伤害
             if (player.fallDistance > 3.0f) {
                 float damageAmount = (float) Math.ceil(player.fallDistance - 3.0f);
                 player.damage(world.getDamageSources().fall(), damageAmount);
@@ -294,7 +336,7 @@ public class DualSyncMod implements ModInitializer {
             player.setOnGround(true);
         }
 
-        // 传送并保持视角独立
+        // 强制位置传送，保持视角独立
         player.networkHandler.requestTeleport(
             targetX,
             finalY,
