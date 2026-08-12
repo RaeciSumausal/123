@@ -8,6 +8,7 @@ import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
 import net.fabricmc.fabric.api.entity.event.v1.ServerPlayerEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.minecraft.block.BlockState;
 import net.minecraft.network.packet.s2c.play.PositionFlag;
 import net.minecraft.network.packet.s2c.play.SubtitleS2CPacket;
 import net.minecraft.network.packet.s2c.play.TitleFadeS2CPacket;
@@ -22,6 +23,7 @@ import net.minecraft.sound.SoundCategory;
 import net.minecraft.sound.SoundEvent;
 import net.minecraft.sound.SoundEvents;
 import net.minecraft.text.Text;
+import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.World;
 
@@ -41,7 +43,7 @@ public class DualSyncMod implements ModInitializer {
     private static Vec3d netherSpawn = null;
     private static boolean customSpawnSet = false;
 
-    // 上一帧记录的位置 (增量位移计算)
+    // 上一帧位置记录 (用于增量同步)
     private static Vec3d p1LastPos = null;
     private static Vec3d p2LastPos = null;
 
@@ -155,8 +157,9 @@ public class DualSyncMod implements ModInitializer {
 
         p1.setVelocity(Vec3d.ZERO);
         p2.setVelocity(Vec3d.ZERO);
+        p1.fallDistance = 0;
+        p2.fallDistance = 0;
 
-        // 强行绑定准确坐标，消除初始帧位置获取不准问题
         p1LastPos = overworldSpawn;
         p2LastPos = netherSpawn;
 
@@ -194,45 +197,94 @@ public class DualSyncMod implements ModInitializer {
         Vec3d p1Cur = p1.getPos();
         Vec3d p2Cur = p2.getPos();
 
-        // 1. 计算本 Tick 双方的 X/Z 位移增量
+        // 1. 计算增量位移
         double d1X = p1Cur.x - p1LastPos.x;
         double d1Z = p1Cur.z - p1LastPos.z;
 
         double d2X = p2Cur.x - p2LastPos.x;
         double d2Z = p2Cur.z - p2LastPos.z;
 
-        // 2. 双向位移同步算法（允许下界玩家使用 WASD 自主移动）
+        // 2. 带有视角独立 + 悬空重力/摔落伤害检测的增量同步
         if (Math.abs(d1X) > 0.0001 || Math.abs(d1Z) > 0.0001) {
             double targetP2X = p2Cur.x + d1X;
             double targetP2Z = p2Cur.z + d1Z;
-            p2.networkHandler.requestTeleport(
-                targetP2X,
-                p2Cur.y, // Y 轴完全留给原版重力/跳跃
-                targetP2Z,
-                0,
-                0,
-                EnumSet.of(PositionFlag.X_ROT, PositionFlag.Y_ROT)
-            );
-            p2Cur = new Vec3d(targetP2X, p2Cur.y, targetP2Z);
+            syncPlayerWithGravity(p2, targetP2X, targetP2Z);
+            p2Cur = p2.getPos();
         }
 
         if (Math.abs(d2X) > 0.0001 || Math.abs(d2Z) > 0.0001) {
             double targetP1X = p1Cur.x + d2X;
             double targetP1Z = p1Cur.z + d2Z;
-            p1.networkHandler.requestTeleport(
-                targetP1X,
-                p1Cur.y, // Y 轴完全留给原版重力/跳跃
-                targetP1Z,
-                0,
-                0,
-                EnumSet.of(PositionFlag.X_ROT, PositionFlag.Y_ROT)
-            );
-            p1Cur = new Vec3d(targetP1X, p1Cur.y, targetP1Z);
+            syncPlayerWithGravity(p1, targetP1X, targetP1Z);
+            p1Cur = p1.getPos();
         }
 
-        // 3. 更新上一帧位置基准
         p1LastPos = p1Cur;
         p2LastPos = p2Cur;
+    }
+
+    // 核心函数：解决视角锁死与悬空重力/摔落伤害计算
+    private void syncPlayerWithGravity(ServerPlayerEntity player, double targetX, double targetZ) {
+        ServerWorld world = player.getServerWorld();
+        double currentY = player.getY();
+        Vec3d vel = player.getVelocity();
+
+        // 检测脚底（Y - 0.1）是否有固体地面
+        BlockPos feetPos = BlockPos.ofFloored(targetX, currentY - 0.1, targetZ);
+        BlockState floorState = world.getBlockState(feetPos);
+        boolean hasGround = !floorState.isAir() && floorState.isOpaqueFullCube(world, feetPos);
+
+        double finalY = currentY;
+
+        if (!hasGround) {
+            // 处于悬空状态：计算重力下落
+            double newVelY = Math.max((vel.y - 0.08) * 0.98, -3.92);
+            double nextY = currentY + newVelY;
+
+            BlockPos landPos = BlockPos.ofFloored(targetX, nextY, targetZ);
+            BlockState landState = world.getBlockState(landPos);
+
+            if (!landState.isAir() && landState.isOpaqueFullCube(world, landPos)) {
+                // 着地碰撞：调整到方块表面
+                finalY = landPos.getY() + 1.0;
+
+                // 结算下落伤害
+                player.fallDistance += (float) Math.max(0, currentY - finalY);
+                if (player.fallDistance > 3.0f) {
+                    float damageAmount = (float) Math.ceil(player.fallDistance - 3.0f);
+                    player.damage(world.getDamageSources().fall(), damageAmount);
+                }
+
+                player.fallDistance = 0.0f;
+                player.setVelocity(vel.x, 0, vel.z);
+                player.setOnGround(true);
+            } else {
+                // 持续自由落体
+                player.fallDistance += (float) Math.max(0, currentY - nextY);
+                finalY = nextY;
+                player.setVelocity(vel.x, newVelY, vel.z);
+                player.velocityModified = true;
+                player.setOnGround(false);
+            }
+        } else {
+            // 在地面平移：若此前悬空积攒了下落高度，结算摔落伤害
+            if (player.fallDistance > 3.0f) {
+                float damageAmount = (float) Math.ceil(player.fallDistance - 3.0f);
+                player.damage(world.getDamageSources().fall(), damageAmount);
+            }
+            player.fallDistance = 0.0f;
+            player.setOnGround(true);
+        }
+
+        // 关键技术点：传入 player.getYaw() 与 player.getPitch() 保证视角 100% 保持独立不被打扰
+        player.networkHandler.requestTeleport(
+            targetX,
+            finalY,
+            targetZ,
+            player.getYaw(),
+            player.getPitch(),
+            EnumSet.of(PositionFlag.X_ROT, PositionFlag.Y_ROT)
+        );
     }
 
     private void onPlayerDeath(MinecraftServer server) {
@@ -262,13 +314,14 @@ public class DualSyncMod implements ModInitializer {
 
             p1.setVelocity(Vec3d.ZERO);
             p2.setVelocity(Vec3d.ZERO);
+            p1.fallDistance = 0;
+            p2.fallDistance = 0;
 
             p1.setHealth(p1.getMaxHealth());
             p2.setHealth(p2.getMaxHealth());
             p1.getHungerManager().setFoodLevel(20);
             p2.getHungerManager().setFoodLevel(20);
 
-            // 彻底解决主世界玩家死亡时下界玩家重置点错位的核心修复：直接赋值为初始起跑坐标常量！
             p1LastPos = overworldSpawn;
             p2LastPos = netherSpawn;
 
