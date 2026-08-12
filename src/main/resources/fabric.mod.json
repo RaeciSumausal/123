@@ -10,7 +10,10 @@
   "environment": "*",
   "entrypoints": {
     "main": [
-      "net.fabricmc.dualsync.DualSyncMod"
+      "com.dualsync.DualSyncMod"
+    ],
+    "client": [
+      "com.dualsync.DualSyncClient"
     ]
   },
   "depends": {
