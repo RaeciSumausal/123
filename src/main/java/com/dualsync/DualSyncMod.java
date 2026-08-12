@@ -7,7 +7,6 @@ import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
-import net.minecraft.network.packet.s2c.play.EntityVelocityUpdateS2CPacket;
 import net.minecraft.network.packet.s2c.play.PositionFlag;
 import net.minecraft.network.packet.s2c.play.SubtitleS2CPacket;
 import net.minecraft.network.packet.s2c.play.TitleFadeS2CPacket;
@@ -235,7 +234,7 @@ public class DualSyncMod implements ModInitializer {
         sharedOffsetX = finalOffsetX;
         sharedOffsetZ = finalOffsetZ;
 
-        // 5. 计算目标坐标并进行精准动量同步
+        // 5. 计算目标 X/Z 坐标并精准矫正
         double targetP1X = overworldSpawn.x + sharedOffsetX;
         double targetP1Z = overworldSpawn.z + sharedOffsetZ;
 
@@ -264,33 +263,27 @@ public class DualSyncMod implements ModInitializer {
         return world.isSpaceEmpty(player, testBox);
     }
 
-    // 核心重构：使用 Velocity 动量注入替代 Teleport，100% 保护 Y 轴重力加速度不被清零
+    // 终极同步算法：结合 PositionFlag.Y 标志位，实现“无拉扯 + 正常重力下落”
     private void syncHorizontalPosition(ServerPlayerEntity player, double targetX, double targetZ) {
         double dx = targetX - player.getX();
         double dz = targetZ - player.getZ();
         double distSq = dx * dx + dz * dz;
 
-        // 1. 严重脱节/卡墙保底（偏差 > 0.5 格）：使用强制传送拉回
-        if (distSq > 0.25) {
+        // 只有当水平偏差大于 0.0001 格 (0.1 毫米) 时才进行同步。
+        // 自己在主动按 WASD 移动的玩家，其位置已经踩在 target 上，distSq 几乎为 0，
+        // 服务端绝不会对他发任何封包，保证 100% 原生平滑手感！
+        if (distSq > 0.0001) {
+            // 核心技巧：指定 PositionFlag.Y, X_ROT, Y_ROT 为相对模式
+            // Y 设为 0.0 (相对)：客户端绝对不会重置/清空 Vy 下落速度，下落手感 100% 原生！
+            // 视角 设为 0.0 (相对)：视角完全不受影响，不会强制扭转镜头！
             player.networkHandler.requestTeleport(
                 targetX,
-                player.getY(),
+                0.0,
                 targetZ,
-                player.getYaw(),
-                player.getPitch(),
-                EnumSet.noneOf(PositionFlag.class)
+                0.0f,
+                0.0f,
+                EnumSet.of(PositionFlag.Y, PositionFlag.X_ROT, PositionFlag.Y_ROT)
             );
-            return;
-        }
-
-        // 2. 正常平滑同步：注入水平动量，保留 Y 轴原生的重力/跳跃速度！
-        if (distSq > 0.0001) {
-            // 保留玩家在服务端当前计算的真实 Y 轴速度（下落加速度/跳跃动量）
-            Vec3d newVel = new Vec3d(dx, player.getVelocity().y, dz);
-            
-            player.setVelocity(newVel);
-            // 发送速度更新封包（网络底层绝不会重置玩家的下落速度）
-            player.networkHandler.sendPacket(new EntityVelocityUpdateS2CPacket(player));
         }
     }
 
