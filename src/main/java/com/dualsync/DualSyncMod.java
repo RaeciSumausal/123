@@ -7,6 +7,7 @@ import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.minecraft.network.packet.s2c.play.EntityVelocityUpdateS2CPacket;
 import net.minecraft.network.packet.s2c.play.PositionFlag;
 import net.minecraft.network.packet.s2c.play.SubtitleS2CPacket;
 import net.minecraft.network.packet.s2c.play.TitleFadeS2CPacket;
@@ -234,7 +235,7 @@ public class DualSyncMod implements ModInitializer {
         sharedOffsetX = finalOffsetX;
         sharedOffsetZ = finalOffsetZ;
 
-        // 5. 计算目标坐标并进行精准同步
+        // 5. 计算目标坐标并进行精准动量同步
         double targetP1X = overworldSpawn.x + sharedOffsetX;
         double targetP1Z = overworldSpawn.z + sharedOffsetZ;
 
@@ -263,15 +264,14 @@ public class DualSyncMod implements ModInitializer {
         return world.isSpaceEmpty(player, testBox);
     }
 
-    // 关键修复：加入 0.05 格 (5厘米) 容差门槛，彻底解决频繁发包导致的滞空无法下落问题
+    // 核心重构：使用 Velocity 动量注入替代 Teleport，100% 保护 Y 轴重力加速度不被清零
     private void syncHorizontalPosition(ServerPlayerEntity player, double targetX, double targetZ) {
         double dx = targetX - player.getX();
         double dz = targetZ - player.getZ();
         double distSq = dx * dx + dz * dz;
 
-        // 只有当水平偏差超过 0.05 格 (5cm, 即 distSq > 0.0025) 时，才触发网络传送强行纠偏
-        // 当两人正常行走/下落时，偏差低于此阈值，不发送传送封包，100% 保持原版重力加速度与下落手感！
-        if (distSq > 0.0025) {
+        // 1. 严重脱节/卡墙保底（偏差 > 0.5 格）：使用强制传送拉回
+        if (distSq > 0.25) {
             player.networkHandler.requestTeleport(
                 targetX,
                 player.getY(),
@@ -280,6 +280,17 @@ public class DualSyncMod implements ModInitializer {
                 player.getPitch(),
                 EnumSet.noneOf(PositionFlag.class)
             );
+            return;
+        }
+
+        // 2. 正常平滑同步：注入水平动量，保留 Y 轴原生的重力/跳跃速度！
+        if (distSq > 0.0001) {
+            // 保留玩家在服务端当前计算的真实 Y 轴速度（下落加速度/跳跃动量）
+            Vec3d newVel = new Vec3d(dx, player.getVelocity().y, dz);
+            
+            player.setVelocity(newVel);
+            // 发送速度更新封包（网络底层绝不会重置玩家的下落速度）
+            player.networkHandler.sendPacket(new EntityVelocityUpdateS2CPacket(player));
         }
     }
 
