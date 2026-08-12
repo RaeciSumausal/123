@@ -1,4 +1,4 @@
-package net.fabricmc.virtualwall;
+package com.dualsync;
 
 import com.mojang.brigadier.arguments.DoubleArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
@@ -23,7 +23,7 @@ import net.minecraft.world.World;
 
 import java.util.*;
 
-public class VirtualWallMod implements ModInitializer {
+public class DualSyncMod implements ModInitializer {
 
     public static final String MOD_ID = "virtualwall";
     public static final Identifier INPUT_C2S_PACKET = new Identifier(MOD_ID, "input_c2s");
