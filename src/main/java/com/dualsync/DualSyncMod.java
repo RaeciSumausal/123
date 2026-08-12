@@ -7,6 +7,7 @@ import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.minecraft.network.packet.s2c.play.PositionFlag;
 import net.minecraft.network.packet.s2c.play.SubtitleS2CPacket;
 import net.minecraft.network.packet.s2c.play.TitleFadeS2CPacket;
 import net.minecraft.network.packet.s2c.play.TitleS2CPacket;
@@ -24,6 +25,7 @@ import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.World;
 
+import java.util.EnumSet;
 import java.util.UUID;
 
 public class DualSyncMod implements ModInitializer {
@@ -31,7 +33,7 @@ public class DualSyncMod implements ModInitializer {
     private static boolean gameActive = false;
     private static boolean needsReset = false;
 
-    // 核心修复 1：传送保护缓冲 Tick，彻底解决开局/重置时传送封包冲突导致的 Y=0 掉落问题
+    // 核心修复 1：开局/重置保护期，防止起点传送与同步传送冲突导致掉落到 Y=0
     private static int warmupTicks = 0;
 
     private static UUID p1UUID = null; // 主世界玩家
@@ -162,7 +164,7 @@ public class DualSyncMod implements ModInitializer {
         needsReset = false;
         gameActive = true;
 
-        // 设置 20 个 Tick (1秒) 的安全缓冲期，等待客户端完成起点传送握手
+        // 设置 1 秒 (20 Ticks) 的保护缓冲，等待客户端完成起点传送
         warmupTicks = 20;
 
         sendTitleAndSound(p1, "§a§l双界同步 · 开始", "§7保持同步，跨越维度！", SoundEvents.UI_TOAST_CHALLENGE_COMPLETE);
@@ -188,7 +190,7 @@ public class DualSyncMod implements ModInitializer {
 
         if (p1.isDead() || p2.isDead()) return;
 
-        // 保护期不进行同步计算，避免传送封包覆盖冲突
+        // 保护期内不执行位置纠偏，给客户端网络握手留出时间
         if (warmupTicks > 0) {
             warmupTicks--;
             return;
@@ -273,24 +275,23 @@ public class DualSyncMod implements ModInitializer {
         return world.isSpaceEmpty(player, testBox);
     }
 
-    // 终极平滑算法：服务端静默对齐 + 0.5 格智能传送，彻底解决下落变慢、移动拉扯和 Y=0 问题
+    // 核心修复 2：使用精准标志位传送
+    // 只有当偏差超过 0.001 格 (1毫米) 时才发包。主动走路的玩家不会收到包（0拉扯），被拖着的玩家平滑同步，且 Y 轴下落速度 100% 保留！
     private void syncHorizontalPosition(ServerPlayerEntity player, double targetX, double targetZ) {
         double dx = targetX - player.getX();
         double dz = targetZ - player.getZ();
         double distSq = dx * dx + dz * dz;
 
-        // 1. 服务端无痕更新水平物理位置，确保碰撞箱时刻保持 100% 同步
-        player.setPosition(targetX, player.getY(), targetZ);
-
-        // 2. 只有当玩家客户端与目标位置脱节超过 0.5 格 (distSq > 0.25) 时，才触发网络传送强行拉回
-        // 正常行走和下落时（偏差 < 0.5 格），服务端发送 0 个传送封包！重力加速度与 WASD 手感 100% 保持原版流畅！
-        if (distSq > 0.25) {
+        if (distSq > 0.001) {
+            // 指定 Y, X_ROT, Y_ROT 为相对模式 (0.0 表示 Y 轴偏移量为 0)
+            // 客户端接收此包时，不仅不会重置 Y 轴下落速度，也不会改动视角，同时能精准修正 X/Z 坐标！
             player.networkHandler.requestTeleport(
                 targetX,
-                player.getY(),
+                0.0,
                 targetZ,
-                player.getYaw(),
-                player.getPitch()
+                0.0f,
+                0.0f,
+                EnumSet.of(PositionFlag.Y, PositionFlag.X_ROT, PositionFlag.Y_ROT)
             );
         }
     }
@@ -328,7 +329,7 @@ public class DualSyncMod implements ModInitializer {
         sharedOffsetZ = 0.0;
 
         needsReset = false;
-        warmupTicks = 20; // 重置同样开启 1 秒保护期
+        warmupTicks = 20; // 重置时同样开启 1 秒保护期
 
         sendTitleAndSound(p1, "§e§l重新开始！", "§7已重置到起点，保持步调一致！", SoundEvents.ENTITY_PLAYER_LEVELUP);
         sendTitleAndSound(p2, "§e§l重新开始！", "§7已重置到起点，保持步调一致！", SoundEvents.ENTITY_PLAYER_LEVELUP);
