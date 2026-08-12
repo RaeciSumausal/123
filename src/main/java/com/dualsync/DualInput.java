@@ -1,4 +1,4 @@
-package net.fabricmc.virtualwall;
+package com.dualsync;
 
 import net.minecraft.network.PacketByteBuf;
 
