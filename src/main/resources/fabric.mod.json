@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "dualsync",
+  "version": "${version}",
+  "name": "Dual Dimensional Sync",
+  "description": "A server-side dual player dimensional sync minigame.",
+  "authors": ["DualSync"],
+  "contact": {},
+  "license": "MIT",
+  "environment": "server",
+  "entrypoints": {
+    "main": [
+      "com.dualsync.DualSyncMod"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.14.22",
+    "minecraft": "~1.20.1",
+    "java": ">=17",
+    "fabric-api": "*"
+  }
+}
