@@ -7,7 +7,6 @@ import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
-import net.minecraft.network.packet.s2c.play.PositionFlag;
 import net.minecraft.network.packet.s2c.play.SubtitleS2CPacket;
 import net.minecraft.network.packet.s2c.play.TitleFadeS2CPacket;
 import net.minecraft.network.packet.s2c.play.TitleS2CPacket;
@@ -25,13 +24,15 @@ import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.World;
 
-import java.util.EnumSet;
 import java.util.UUID;
 
 public class DualSyncMod implements ModInitializer {
 
     private static boolean gameActive = false;
     private static boolean needsReset = false;
+
+    // 核心修复 1：传送保护缓冲 Tick，彻底解决开局/重置时传送封包冲突导致的 Y=0 掉落问题
+    private static int warmupTicks = 0;
 
     private static UUID p1UUID = null; // 主世界玩家
     private static UUID p2UUID = null; // 下界玩家
@@ -161,6 +162,9 @@ public class DualSyncMod implements ModInitializer {
         needsReset = false;
         gameActive = true;
 
+        // 设置 20 个 Tick (1秒) 的安全缓冲期，等待客户端完成起点传送握手
+        warmupTicks = 20;
+
         sendTitleAndSound(p1, "§a§l双界同步 · 开始", "§7保持同步，跨越维度！", SoundEvents.UI_TOAST_CHALLENGE_COMPLETE);
         sendTitleAndSound(p2, "§a§l双界同步 · 开始", "§7保持同步，跨越维度！", SoundEvents.UI_TOAST_CHALLENGE_COMPLETE);
 
@@ -183,6 +187,12 @@ public class DualSyncMod implements ModInitializer {
         }
 
         if (p1.isDead() || p2.isDead()) return;
+
+        // 保护期不进行同步计算，避免传送封包覆盖冲突
+        if (warmupTicks > 0) {
+            warmupTicks--;
+            return;
+        }
 
         // 维度跨越胜利判定
         boolean p1Crossed = !p1.getWorld().getRegistryKey().equals(p1StartDimension);
@@ -234,7 +244,7 @@ public class DualSyncMod implements ModInitializer {
         sharedOffsetX = finalOffsetX;
         sharedOffsetZ = finalOffsetZ;
 
-        // 5. 计算目标 X/Z 坐标并精准矫正
+        // 5. 计算目标 X/Z 坐标并优雅同步
         double targetP1X = overworldSpawn.x + sharedOffsetX;
         double targetP1Z = overworldSpawn.z + sharedOffsetZ;
 
@@ -263,26 +273,24 @@ public class DualSyncMod implements ModInitializer {
         return world.isSpaceEmpty(player, testBox);
     }
 
-    // 终极同步算法：结合 PositionFlag.Y 标志位，实现“无拉扯 + 正常重力下落”
+    // 终极平滑算法：服务端静默对齐 + 0.5 格智能传送，彻底解决下落变慢、移动拉扯和 Y=0 问题
     private void syncHorizontalPosition(ServerPlayerEntity player, double targetX, double targetZ) {
         double dx = targetX - player.getX();
         double dz = targetZ - player.getZ();
         double distSq = dx * dx + dz * dz;
 
-        // 只有当水平偏差大于 0.0001 格 (0.1 毫米) 时才进行同步。
-        // 自己在主动按 WASD 移动的玩家，其位置已经踩在 target 上，distSq 几乎为 0，
-        // 服务端绝不会对他发任何封包，保证 100% 原生平滑手感！
-        if (distSq > 0.0001) {
-            // 核心技巧：指定 PositionFlag.Y, X_ROT, Y_ROT 为相对模式
-            // Y 设为 0.0 (相对)：客户端绝对不会重置/清空 Vy 下落速度，下落手感 100% 原生！
-            // 视角 设为 0.0 (相对)：视角完全不受影响，不会强制扭转镜头！
+        // 1. 服务端无痕更新水平物理位置，确保碰撞箱时刻保持 100% 同步
+        player.setPosition(targetX, player.getY(), targetZ);
+
+        // 2. 只有当玩家客户端与目标位置脱节超过 0.5 格 (distSq > 0.25) 时，才触发网络传送强行拉回
+        // 正常行走和下落时（偏差 < 0.5 格），服务端发送 0 个传送封包！重力加速度与 WASD 手感 100% 保持原版流畅！
+        if (distSq > 0.25) {
             player.networkHandler.requestTeleport(
                 targetX,
-                0.0,
+                player.getY(),
                 targetZ,
-                0.0f,
-                0.0f,
-                EnumSet.of(PositionFlag.Y, PositionFlag.X_ROT, PositionFlag.Y_ROT)
+                player.getYaw(),
+                player.getPitch()
             );
         }
     }
@@ -320,6 +328,7 @@ public class DualSyncMod implements ModInitializer {
         sharedOffsetZ = 0.0;
 
         needsReset = false;
+        warmupTicks = 20; // 重置同样开启 1 秒保护期
 
         sendTitleAndSound(p1, "§e§l重新开始！", "§7已重置到起点，保持步调一致！", SoundEvents.ENTITY_PLAYER_LEVELUP);
         sendTitleAndSound(p2, "§e§l重新开始！", "§7已重置到起点，保持步调一致！", SoundEvents.ENTITY_PLAYER_LEVELUP);
