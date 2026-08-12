@@ -41,7 +41,7 @@ public class DualSyncMod implements ModInitializer {
     private static Vec3d netherSpawn = null;
     private static boolean customSpawnSet = false;
 
-    // 核心解耦：全局唯一共享偏移量（相对于起点的 X 和 Z 位移）
+    // 全局唯一共享偏移量（绝对防漂移）
     private static double sharedOffsetX = 0.0;
     private static double sharedOffsetZ = 0.0;
 
@@ -152,7 +152,6 @@ public class DualSyncMod implements ModInitializer {
         p1.fallDistance = 0;
         p2.fallDistance = 0;
 
-        // 每次开始重置偏移量为 0
         sharedOffsetX = 0.0;
         sharedOffsetZ = 0.0;
 
@@ -235,7 +234,7 @@ public class DualSyncMod implements ModInitializer {
         sharedOffsetX = finalOffsetX;
         sharedOffsetZ = finalOffsetZ;
 
-        // 5. 由全局唯一偏移量计算出两名玩家应该在的绝对位置，强行绑定同步！
+        // 5. 计算目标坐标并进行精准同步
         double targetP1X = overworldSpawn.x + sharedOffsetX;
         double targetP1Z = overworldSpawn.z + sharedOffsetZ;
 
@@ -264,14 +263,15 @@ public class DualSyncMod implements ModInitializer {
         return world.isSpaceEmpty(player, testBox);
     }
 
-    // 绝对防漂移同步：只要偏离唯一基准线，就立刻修正
+    // 关键修复：加入 0.05 格 (5厘米) 容差门槛，彻底解决频繁发包导致的滞空无法下落问题
     private void syncHorizontalPosition(ServerPlayerEntity player, double targetX, double targetZ) {
         double dx = targetX - player.getX();
         double dz = targetZ - player.getZ();
         double distSq = dx * dx + dz * dz;
 
-        // 极其灵敏的微米级修正，保证玩家即使高速持续移动也丝滑贴合基准线
-        if (distSq > 0.000001) {
+        // 只有当水平偏差超过 0.05 格 (5cm, 即 distSq > 0.0025) 时，才触发网络传送强行纠偏
+        // 当两人正常行走/下落时，偏差低于此阈值，不发送传送封包，100% 保持原版重力加速度与下落手感！
+        if (distSq > 0.0025) {
             player.networkHandler.requestTeleport(
                 targetX,
                 player.getY(),
@@ -312,7 +312,6 @@ public class DualSyncMod implements ModInitializer {
         p1.getHungerManager().setFoodLevel(20);
         p2.getHungerManager().setFoodLevel(20);
 
-        // 重置时清零偏移量
         sharedOffsetX = 0.0;
         sharedOffsetZ = 0.0;
 
