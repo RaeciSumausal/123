@@ -175,7 +175,7 @@ public class DualSyncMod implements ModInitializer {
 
         if (p1 == null || p2 == null) return;
 
-        // 安全复活重置检测（确保双方均在世界中完成复活）
+        // 安全复活重置检测
         if (needsReset) {
             if (p1.isAlive() && !p1.isDead() && p2.isAlive() && !p2.isDead()) {
                 executeReset(server, p1, p2);
@@ -207,7 +207,7 @@ public class DualSyncMod implements ModInitializer {
         double targetDX = d1X + d2X;
         double targetDZ = d1Z + d2Z;
 
-        // 2. 轴向墙壁碰撞检测 (只检测 1 格以上的实体墙壁，避开 0.6 格高台阶)
+        // 2. 轴向墙壁碰撞检测 (只检测 0.6 格以上的实体墙壁，避开半砖和台阶)
         double finalDX = 0;
         if (Math.abs(targetDX) > 0.0001) {
             if (canPlayerMoveTo(p1, p1LastPos.x + targetDX, p1LastPos.z) &&
@@ -230,7 +230,7 @@ public class DualSyncMod implements ModInitializer {
         double targetP2X = p2LastPos.x + finalDX;
         double targetP2Z = p2LastPos.z + finalDZ;
 
-        // 3. 仅同步 X/Z 水平轴，Y 轴（跳跃/重力/下落/摔落伤害）全权交给 Minecraft 原版物理引擎处理
+        // 3. 修正水平同步：传入玩家真正的实际 Y 坐标，绝不上锁或重置高度
         syncHorizontalPosition(p1, targetP1X, targetP1Z, p1Cur);
         syncHorizontalPosition(p2, targetP2X, targetP2Z, p2Cur);
 
@@ -238,7 +238,7 @@ public class DualSyncMod implements ModInitializer {
         p2LastPos = p2.getPos();
     }
 
-    // 精准实体墙壁碰撞检测：避开台阶 (0.6 格以上)
+    // 精准实体墙壁碰撞检测
     private boolean canPlayerMoveTo(ServerPlayerEntity player, double targetX, double targetZ) {
         ServerWorld world = player.getServerWorld();
         double currentY = player.getY();
@@ -257,19 +257,19 @@ public class DualSyncMod implements ModInitializer {
         return world.isSpaceEmpty(player, testBox);
     }
 
-    // 纯水平同步核心：通过 PositionFlag.Y 维持原生跳跃与重力
+    // 修复后的同步逻辑：使用 player.getY() 维持绝对高度，仅旋转属性使用相对增量
     private void syncHorizontalPosition(ServerPlayerEntity player, double targetX, double targetZ, Vec3d currentPos) {
         double distSq = (targetX - currentPos.x) * (targetX - currentPos.x) + (targetZ - currentPos.z) * (targetZ - currentPos.z);
 
-        // 仅在位置受到限制或需要修正时触发网络传输
+        // 仅在被墙体限制或增量偏差时同步
         if (distSq > 0.000001) {
             player.networkHandler.requestTeleport(
                 targetX,
-                0.0, // 增量为 0，不干扰 Y 轴
+                player.getY(), // 关键修复：使用玩家当前真实的 Y 坐标！
                 targetZ,
-                0.0f,
-                0.0f,
-                EnumSet.of(PositionFlag.Y, PositionFlag.X_ROT, PositionFlag.Y_ROT)
+                0.0f,          // 视角增量 0
+                0.0f,          // 视角增量 0
+                EnumSet.of(PositionFlag.X_ROT, PositionFlag.Y_ROT) // 仅旋转使用相对模式
             );
         }
     }
