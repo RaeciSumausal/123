@@ -31,7 +31,7 @@ import java.util.UUID;
 public class DualSyncMod implements ModInitializer {
 
     private static boolean gameActive = false;
-    private static boolean needsReset = false; // 死亡等待重置标记，防止复活时间差导致位移错误
+    private static boolean needsReset = false;
 
     private static UUID p1UUID = null; // 主世界玩家
     private static UUID p2UUID = null; // 下界玩家
@@ -41,9 +41,9 @@ public class DualSyncMod implements ModInitializer {
     private static Vec3d netherSpawn = null;
     private static boolean customSpawnSet = false;
 
-    // 运行过程中的基准位置
-    private static Vec3d p1StartPos = null;
-    private static Vec3d p2StartPos = null;
+    // 上一帧记录的位置 (增量位移计算)
+    private static Vec3d p1LastPos = null;
+    private static Vec3d p2LastPos = null;
 
     // 起始维度
     private static RegistryKey<World> p1StartDimension = World.OVERWORLD;
@@ -51,15 +51,12 @@ public class DualSyncMod implements ModInitializer {
 
     @Override
     public void onInitialize() {
-        // 1. 注册指令
         CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
             registerCommands(dispatcher);
         });
 
-        // 2. 注册主循环 Tick
         ServerTickEvents.END_SERVER_TICK.register(this::onServerTick);
 
-        // 3. 注册死亡监听
         ServerLivingEntityEvents.AFTER_DEATH.register((entity, damageSource) -> {
             if (gameActive && entity instanceof ServerPlayerEntity player) {
                 if (player.getUuid().equals(p1UUID) || player.getUuid().equals(p2UUID)) {
@@ -68,7 +65,6 @@ public class DualSyncMod implements ModInitializer {
             }
         });
 
-        // 4. 注册复活监听 (必须等待双方均复活后再同步)
         ServerPlayerEvents.AFTER_RESPAWN.register((oldPlayer, newPlayer, alive) -> {
             if (gameActive && (newPlayer.getUuid().equals(p1UUID) || newPlayer.getUuid().equals(p2UUID))) {
                 checkAndPerformReset(newPlayer.getServer());
@@ -154,12 +150,15 @@ public class DualSyncMod implements ModInitializer {
         ServerWorld overworld = server.getWorld(World.OVERWORLD);
         ServerWorld nether = server.getWorld(World.NETHER);
 
-        // 传送至起跑点
         p1.teleport(overworld, overworldSpawn.x, overworldSpawn.y, overworldSpawn.z, p1.getYaw(), p1.getPitch());
         p2.teleport(nether, netherSpawn.x, netherSpawn.y, netherSpawn.z, p2.getYaw(), p2.getPitch());
 
-        p1StartPos = overworldSpawn;
-        p2StartPos = netherSpawn;
+        p1.setVelocity(Vec3d.ZERO);
+        p2.setVelocity(Vec3d.ZERO);
+
+        // 强行绑定准确坐标，消除初始帧位置获取不准问题
+        p1LastPos = overworldSpawn;
+        p2LastPos = netherSpawn;
 
         p1StartDimension = World.OVERWORLD;
         p2StartDimension = World.NETHER;
@@ -174,7 +173,6 @@ public class DualSyncMod implements ModInitializer {
     }
 
     private void onServerTick(MinecraftServer server) {
-        // 如果游戏未开启或处于重置等待期间，暂停同步计算
         if (!gameActive || needsReset) return;
 
         ServerPlayerEntity p1 = server.getPlayerManager().getPlayer(p1UUID);
@@ -184,7 +182,7 @@ public class DualSyncMod implements ModInitializer {
             return;
         }
 
-        // 维度跨越检测（胜利条件）
+        // 维度跨越检测（胜利）
         boolean p1Crossed = !p1.getWorld().getRegistryKey().equals(p1StartDimension);
         boolean p2Crossed = !p2.getWorld().getRegistryKey().equals(p2StartDimension);
 
@@ -193,38 +191,54 @@ public class DualSyncMod implements ModInitializer {
             return;
         }
 
-        // 1. 计算 P1 在 X/Z 水平面上的相对位移
-        double deltaX = p1.getX() - p1StartPos.x;
-        double deltaZ = p1.getZ() - p1StartPos.z;
+        Vec3d p1Cur = p1.getPos();
+        Vec3d p2Cur = p2.getPos();
 
-        // 2. 下界玩家的目标水平坐标
-        double targetX = p2StartPos.x + deltaX;
-        double targetZ = p2StartPos.z + deltaZ;
+        // 1. 计算本 Tick 双方的 X/Z 位移增量
+        double d1X = p1Cur.x - p1LastPos.x;
+        double d1Z = p1Cur.z - p1LastPos.z;
 
-        // 3. 计算与上一帧的偏差
-        double currentDx = targetX - p2.getX();
-        double currentDz = targetZ - p2.getZ();
-        double distSq = currentDx * currentDx + currentDz * currentDz;
+        double d2X = p2Cur.x - p2LastPos.x;
+        double d2Z = p2Cur.z - p2LastPos.z;
 
-        // 解决问题 1：仅在 P1 真正发生 X/Z 移动时才发包更新，防止频繁发包挤掉 UI 和操作
-        if (distSq > 0.0001) {
-            // 解决问题 2：传参使用 p2.getY()，完全把 Y 轴交给原版重力、跳跃和落体物理
+        // 2. 双向位移同步算法（允许下界玩家使用 WASD 自主移动）
+        if (Math.abs(d1X) > 0.0001 || Math.abs(d1Z) > 0.0001) {
+            double targetP2X = p2Cur.x + d1X;
+            double targetP2Z = p2Cur.z + d1Z;
             p2.networkHandler.requestTeleport(
-                targetX,
-                p2.getY(), 
-                targetZ,
+                targetP2X,
+                p2Cur.y, // Y 轴完全留给原版重力/跳跃
+                targetP2Z,
                 0,
                 0,
-                EnumSet.of(PositionFlag.X_ROT, PositionFlag.Y_ROT) // 保持 P2 视角可自由旋转
+                EnumSet.of(PositionFlag.X_ROT, PositionFlag.Y_ROT)
             );
+            p2Cur = new Vec3d(targetP2X, p2Cur.y, targetP2Z);
         }
+
+        if (Math.abs(d2X) > 0.0001 || Math.abs(d2Z) > 0.0001) {
+            double targetP1X = p1Cur.x + d2X;
+            double targetP1Z = p1Cur.z + d2Z;
+            p1.networkHandler.requestTeleport(
+                targetP1X,
+                p1Cur.y, // Y 轴完全留给原版重力/跳跃
+                targetP1Z,
+                0,
+                0,
+                EnumSet.of(PositionFlag.X_ROT, PositionFlag.Y_ROT)
+            );
+            p1Cur = new Vec3d(targetP1X, p1Cur.y, targetP1Z);
+        }
+
+        // 3. 更新上一帧位置基准
+        p1LastPos = p1Cur;
+        p2LastPos = p2Cur;
     }
 
     private void onPlayerDeath(MinecraftServer server) {
         if (!gameActive || needsReset) return;
 
-        // 标记需要重置，此时在两人均复活之前，tick 内的坐标同步会被冻结
-        needsReset = true; 
+        needsReset = true;
 
         ServerPlayerEntity p1 = server.getPlayerManager().getPlayer(p1UUID);
         ServerPlayerEntity p2 = server.getPlayerManager().getPlayer(p2UUID);
@@ -239,7 +253,6 @@ public class DualSyncMod implements ModInitializer {
         ServerPlayerEntity p1 = server.getPlayerManager().getPlayer(p1UUID);
         ServerPlayerEntity p2 = server.getPlayerManager().getPlayer(p2UUID);
 
-        // 解决问题 3：只有当两个人均从死亡界面点击复活、且在服内存活时，才精准执行一次统一传送重置
         if (p1 != null && p2 != null && !p1.isDead() && !p2.isDead()) {
             ServerWorld overworld = server.getWorld(World.OVERWORLD);
             ServerWorld nether = server.getWorld(World.NETHER);
@@ -247,16 +260,18 @@ public class DualSyncMod implements ModInitializer {
             p1.teleport(overworld, overworldSpawn.x, overworldSpawn.y, overworldSpawn.z, p1.getYaw(), p1.getPitch());
             p2.teleport(nether, netherSpawn.x, netherSpawn.y, netherSpawn.z, p2.getYaw(), p2.getPitch());
 
+            p1.setVelocity(Vec3d.ZERO);
+            p2.setVelocity(Vec3d.ZERO);
+
             p1.setHealth(p1.getMaxHealth());
             p2.setHealth(p2.getMaxHealth());
             p1.getHungerManager().setFoodLevel(20);
             p2.getHungerManager().setFoodLevel(20);
 
-            // 重新刷新准确的基准坐标
-            p1StartPos = p1.getPos();
-            p2StartPos = p2.getPos();
+            // 彻底解决主世界玩家死亡时下界玩家重置点错位的核心修复：直接赋值为初始起跑坐标常量！
+            p1LastPos = overworldSpawn;
+            p2LastPos = netherSpawn;
 
-            // 恢复同步功能
             needsReset = false;
 
             sendTitleAndSound(p1, "§e§l重新开始！", "§7已重置到起点，保持步调一致！", SoundEvents.ENTITY_PLAYER_LEVELUP);
