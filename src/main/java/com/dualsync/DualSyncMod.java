@@ -101,7 +101,7 @@ public class DualSyncMod implements ModInitializer {
                     return 1;
                 }))))))
 
-            // 指令 2: 清空坐标 (需求 2)
+            // 指令 2: 清空坐标
             .then(CommandManager.literal("clearspawn")
                 .executes(ctx -> {
                     overworldSpawn = null;
@@ -152,7 +152,7 @@ public class DualSyncMod implements ModInitializer {
         ServerWorld overworld = server.getWorld(World.OVERWORLD);
         ServerWorld nether = server.getWorld(World.NETHER);
 
-        // 若未手动设置坐标，自动寻找安全位置 (需求 2)
+        // 若未手动设置坐标，自动寻找安全位置
         if (!customSpawnSet || overworldSpawn == null || netherSpawn == null) {
             overworldSpawn = findSafeSpawn(overworld, p1.getBlockPos());
             netherSpawn = findSafeSpawn(nether, p2.getBlockPos());
@@ -170,7 +170,7 @@ public class DualSyncMod implements ModInitializer {
 
         gameActive = true;
 
-        // 音效与文字标题效果 (需求 1)
+        // 音效与文字标题效果
         sendTitleAndSound(p1, "§a§l双界同步 · 开始", "§7保持同步，跨越维度！", SoundEvents.UI_TOAST_CHALLENGE_COMPLETE);
         sendTitleAndSound(p2, "§a§l双界同步 · 开始", "§7保持同步，跨越维度！", SoundEvents.UI_TOAST_CHALLENGE_COMPLETE);
 
@@ -187,7 +187,7 @@ public class DualSyncMod implements ModInitializer {
             return;
         }
 
-        // 问题 3 修复：检测跨越维度触发胜利
+        // 检测跨越维度触发胜利
         boolean p1Crossed = !p1.getWorld().getRegistryKey().equals(p1StartDimension);
         boolean p2Crossed = !p2.getWorld().getRegistryKey().equals(p2StartDimension);
 
@@ -196,7 +196,7 @@ public class DualSyncMod implements ModInitializer {
             return;
         }
 
-        // 问题 4 修复：位置同步与重力下落处理
+        // 位置同步与重力下落处理
         Vec3d delta1 = p1.getPos().subtract(p1StartPos);
         Vec3d targetP2Pos = p2StartPos.add(delta1);
 
@@ -227,7 +227,7 @@ public class DualSyncMod implements ModInitializer {
         ServerPlayerEntity p1 = server.getPlayerManager().getPlayer(p1UUID);
         ServerPlayerEntity p2 = server.getPlayerManager().getPlayer(p2UUID);
 
-        // 音效与标题：死亡提示 (需求 1)
+        // 音效与标题：死亡提示
         if (p1 != null) sendTitleAndSound(p1, "§c§l挑战失败", "§7一名玩家已阵亡，即将重置...", SoundEvents.ENTITY_WITHER_DEATH);
         if (p2 != null) sendTitleAndSound(p2, "§c§l挑战失败", "§7一名玩家已阵亡，即将重置...", SoundEvents.ENTITY_WITHER_DEATH);
     }
@@ -243,7 +243,7 @@ public class DualSyncMod implements ModInitializer {
         ServerWorld overworld = server.getWorld(World.OVERWORLD);
         ServerWorld nether = server.getWorld(World.NETHER);
 
-        // 问题 1 & 2 修复：分别送回主世界与下界，重置状态与锚点
+        // 分别送回主世界与下界，重置状态与锚点
         p1.teleport(overworld, overworldSpawn.x, overworldSpawn.y, overworldSpawn.z, p1.getYaw(), p1.getPitch());
         p2.teleport(nether, netherSpawn.x, netherSpawn.y, netherSpawn.z, p2.getYaw(), p2.getPitch());
 
@@ -256,7 +256,7 @@ public class DualSyncMod implements ModInitializer {
         p1StartPos = p1.getPos();
         p2StartPos = p2.getPos();
 
-        // 恢复后音效与标题 (需求 1)
+        // 恢复后音效与标题
         sendTitleAndSound(p1, "§e§l重新开始！", "§7已重置到起点，保持步调一致！", SoundEvents.ENTITY_PLAYER_LEVELUP);
         sendTitleAndSound(p2, "§e§l重新开始！", "§7已重置到起点，保持步调一致！", SoundEvents.ENTITY_PLAYER_LEVELUP);
     }
@@ -264,9 +264,9 @@ public class DualSyncMod implements ModInitializer {
     private void triggerVictory(MinecraftServer server, ServerPlayerEntity p1, ServerPlayerEntity p2) {
         gameActive = false;
 
-        // 通关音效与全屏标题 (需求 1 & 问题 3)
-        sendTitleAndSound(p1, "§6§l🎉 挑战成功！", "§a你们成功打破空间藩篱，完成了双界同步！", SoundEvents.UI_GOAT_HORN_PLAY_0);
-        sendTitleAndSound(p2, "§6§l🎉 挑战成功！", "§a你们成功打破空间藩篱，完成了双界同步！", SoundEvents.UI_GOAT_HORN_PLAY_0);
+        // 通关音效与全屏标题
+        sendTitleAndSound(p1, "§6§l🎉 挑战成功！", "§a你们成功打破空间藩篱，完成了双界同步！", SoundEvents.UI_TOAST_CHALLENGE_COMPLETE);
+        sendTitleAndSound(p2, "§6§l🎉 挑战成功！", "§a你们成功打破空间藩篱，完成了双界同步！", SoundEvents.UI_TOAST_CHALLENGE_COMPLETE);
 
         broadcast(server, "§6[DualSync] 恭喜玩家 " + p1.getName().getString() + " 与 " + p2.getName().getString() + " 成功通关！");
     }
@@ -276,7 +276,7 @@ public class DualSyncMod implements ModInitializer {
         broadcast(server, "§c[DualSync] 游戏已终止：" + reason);
     }
 
-    // 自动寻找安全地面算法 (需求 2)
+    // 自动寻找安全地面算法
     private Vec3d findSafeSpawn(ServerWorld world, BlockPos origin) {
         BlockPos.Mutable mutable = origin.mutableCopy();
         for (int y = origin.getY(); y > world.getBottomY() + 5; y--) {
@@ -292,7 +292,7 @@ public class DualSyncMod implements ModInitializer {
         return new Vec3d(origin.getX() + 0.5, origin.getY(), origin.getZ() + 0.5);
     }
 
-    // 发送大标题 + 音效工具类 (需求 1)
+    // 发送大标题 + 音效工具类
     private void sendTitleAndSound(ServerPlayerEntity player, String title, String subtitle, SoundEvent sound) {
         player.networkHandler.sendPacket(new TitleFadeS2CPacket(10, 70, 20));
         if (title != null) {
