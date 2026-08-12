@@ -24,7 +24,10 @@ import net.minecraft.sound.SoundEvent;
 import net.minecraft.sound.SoundEvents;
 import net.minecraft.text.Text;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Box;
+import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
+import net.minecraft.util.shape.VoxelShape;
 import net.minecraft.world.World;
 
 import java.util.EnumSet;
@@ -43,7 +46,7 @@ public class DualSyncMod implements ModInitializer {
     private static Vec3d netherSpawn = null;
     private static boolean customSpawnSet = false;
 
-    // 上一帧位置记录 (用于增量同步)
+    // 上一帧位置记录 (增量同步)
     private static Vec3d p1LastPos = null;
     private static Vec3d p2LastPos = null;
 
@@ -204,7 +207,7 @@ public class DualSyncMod implements ModInitializer {
         double d2X = p2Cur.x - p2LastPos.x;
         double d2Z = p2Cur.z - p2LastPos.z;
 
-        // 2. 带有视角独立 + 悬空重力/摔落伤害检测的增量同步
+        // 2. 双向同步位移
         if (Math.abs(d1X) > 0.0001 || Math.abs(d1Z) > 0.0001) {
             double targetP2X = p2Cur.x + d1X;
             double targetP2Z = p2Cur.z + d1Z;
@@ -223,30 +226,45 @@ public class DualSyncMod implements ModInitializer {
         p2LastPos = p2Cur;
     }
 
-    // 核心函数：解决视角锁死与悬空重力/摔落伤害计算
     private void syncPlayerWithGravity(ServerPlayerEntity player, double targetX, double targetZ) {
         ServerWorld world = player.getServerWorld();
         double currentY = player.getY();
         Vec3d vel = player.getVelocity();
 
-        // 检测脚底（Y - 0.1）是否有固体地面
-        BlockPos feetPos = BlockPos.ofFloored(targetX, currentY - 0.1, targetZ);
-        BlockState floorState = world.getBlockState(feetPos);
-        boolean hasGround = !floorState.isAir() && floorState.isOpaqueFullCube(world, feetPos);
+        // 核心修复：使用玩家真实的碰撞箱 (AABB, 0.6x0.6) 向下扩展 0.05 格进行地面判定
+        // 只要碰撞箱有任何边缘踩在方块上（如潜行在边缘、半砖、楼梯等），都视为拥有地面支持
+        Box checkGroundBox = new Box(
+            targetX - 0.29, currentY - 0.05, targetZ - 0.29,
+            targetX + 0.29, currentY,        targetZ + 0.29
+        );
+        boolean hasGround = !world.isSpaceEmpty(player, checkGroundBox);
 
         double finalY = currentY;
 
         if (!hasGround) {
-            // 处于悬空状态：计算重力下落
+            // 真正完全悬空时：计算重力下落
             double newVelY = Math.max((vel.y - 0.08) * 0.98, -3.92);
             double nextY = currentY + newVelY;
 
-            BlockPos landPos = BlockPos.ofFloored(targetX, nextY, targetZ);
-            BlockState landState = world.getBlockState(landPos);
+            // 检测下落路径上是否踩到地面
+            Box landBox = new Box(
+                targetX - 0.29, nextY, targetZ - 0.29,
+                targetX + 0.29, currentY, targetZ + 0.29
+            );
 
-            if (!landState.isAir() && landState.isOpaqueFullCube(world, landPos)) {
-                // 着地碰撞：调整到方块表面
-                finalY = landPos.getY() + 1.0;
+            if (!world.isSpaceEmpty(player, landBox)) {
+                // 着地碰撞：精确计算地面最高点 (兼容半砖、地毯等非完整方块)
+                BlockPos landPos = BlockPos.ofFloored(targetX, nextY, targetZ);
+                BlockState landState = world.getBlockState(landPos);
+                double blockTopY = landPos.getY() + 1.0;
+
+                if (!landState.isAir()) {
+                    VoxelShape shape = landState.getCollisionShape(world, landPos);
+                    if (!shape.isEmpty()) {
+                        blockTopY = landPos.getY() + shape.getMax(Direction.Axis.Y);
+                    }
+                }
+                finalY = blockTopY;
 
                 // 结算下落伤害
                 player.fallDistance += (float) Math.max(0, currentY - finalY);
@@ -267,7 +285,7 @@ public class DualSyncMod implements ModInitializer {
                 player.setOnGround(false);
             }
         } else {
-            // 在地面平移：若此前悬空积攒了下落高度，结算摔落伤害
+            // 在地面平移/潜行：若此前悬空积攒了下落高度，结算摔落伤害
             if (player.fallDistance > 3.0f) {
                 float damageAmount = (float) Math.ceil(player.fallDistance - 3.0f);
                 player.damage(world.getDamageSources().fall(), damageAmount);
@@ -276,7 +294,7 @@ public class DualSyncMod implements ModInitializer {
             player.setOnGround(true);
         }
 
-        // 关键技术点：传入 player.getYaw() 与 player.getPitch() 保证视角 100% 保持独立不被打扰
+        // 传送并保持视角独立
         player.networkHandler.requestTeleport(
             targetX,
             finalY,
