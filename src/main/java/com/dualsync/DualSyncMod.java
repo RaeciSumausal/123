@@ -36,14 +36,14 @@ public class DualSyncMod implements ModInitializer {
     private static UUID p1UUID = null; // 主世界玩家
     private static UUID p2UUID = null; // 下界玩家
 
-    // 起跑坐标
+    // 起跑绝对坐标
     private static Vec3d overworldSpawn = null;
     private static Vec3d netherSpawn = null;
     private static boolean customSpawnSet = false;
 
-    // 上一帧基准坐标
-    private static Vec3d p1LastPos = null;
-    private static Vec3d p2LastPos = null;
+    // 核心解耦：全局唯一共享偏移量（相对于起点的 X 和 Z 位移）
+    private static double sharedOffsetX = 0.0;
+    private static double sharedOffsetZ = 0.0;
 
     // 起始维度
     private static RegistryKey<World> p1StartDimension = World.OVERWORLD;
@@ -152,8 +152,9 @@ public class DualSyncMod implements ModInitializer {
         p1.fallDistance = 0;
         p2.fallDistance = 0;
 
-        p1LastPos = overworldSpawn;
-        p2LastPos = netherSpawn;
+        // 每次开始重置偏移量为 0
+        sharedOffsetX = 0.0;
+        sharedOffsetZ = 0.0;
 
         p1StartDimension = World.OVERWORLD;
         p2StartDimension = World.NETHER;
@@ -175,7 +176,6 @@ public class DualSyncMod implements ModInitializer {
 
         if (p1 == null || p2 == null) return;
 
-        // 安全复活重置检测
         if (needsReset) {
             if (p1.isAlive() && !p1.isDead() && p2.isAlive() && !p2.isDead()) {
                 executeReset(server, p1, p2);
@@ -185,7 +185,7 @@ public class DualSyncMod implements ModInitializer {
 
         if (p1.isDead() || p2.isDead()) return;
 
-        // 维度跨越检测（胜利条件）
+        // 维度跨越胜利判定
         boolean p1Crossed = !p1.getWorld().getRegistryKey().equals(p1StartDimension);
         boolean p2Crossed = !p2.getWorld().getRegistryKey().equals(p2StartDimension);
 
@@ -194,51 +194,58 @@ public class DualSyncMod implements ModInitializer {
             return;
         }
 
-        Vec3d p1Cur = p1.getPos();
-        Vec3d p2Cur = p2.getPos();
+        // 1. 计算两名玩家当前相对于起点的【实际偏移】
+        double p1RealOffsetX = p1.getX() - overworldSpawn.x;
+        double p1RealOffsetZ = p1.getZ() - overworldSpawn.z;
 
-        // 1. 计算双方本 Tick 的水平增量位移
-        double d1X = p1Cur.x - p1LastPos.x;
-        double d1Z = p1Cur.z - p1LastPos.z;
+        double p2RealOffsetX = p2.getX() - netherSpawn.x;
+        double p2RealOffsetZ = p2.getZ() - netherSpawn.z;
 
-        double d2X = p2Cur.x - p2LastPos.x;
-        double d2Z = p2Cur.z - p2LastPos.z;
+        // 2. 计算两名玩家在本 Tick 产生的“新贡献位移”
+        double d1X = p1RealOffsetX - sharedOffsetX;
+        double d1Z = p1RealOffsetZ - sharedOffsetZ;
+
+        double d2X = p2RealOffsetX - sharedOffsetX;
+        double d2Z = p2RealOffsetZ - sharedOffsetZ;
 
         double targetDX = d1X + d2X;
         double targetDZ = d1Z + d2Z;
 
-        // 2. 轴向墙壁碰撞检测 (只检测 0.6 格以上的实体墙壁，避开半砖和台阶)
-        double finalDX = 0;
-        if (Math.abs(targetDX) > 0.0001) {
-            if (canPlayerMoveTo(p1, p1LastPos.x + targetDX, p1LastPos.z) &&
-                canPlayerMoveTo(p2, p2LastPos.x + targetDX, p2LastPos.z)) {
-                finalDX = targetDX;
+        // 3. 碰撞检测，尝试推进 sharedOffset
+        double tryNextOffsetX = sharedOffsetX + targetDX;
+        double tryNextOffsetZ = sharedOffsetZ + targetDZ;
+
+        double finalOffsetX = sharedOffsetX;
+        if (Math.abs(targetDX) > 0.00001) {
+            if (canPlayerMoveTo(p1, overworldSpawn.x + tryNextOffsetX, p1.getZ()) &&
+                canPlayerMoveTo(p2, netherSpawn.x + tryNextOffsetX, p2.getZ())) {
+                finalOffsetX = tryNextOffsetX;
             }
         }
 
-        double finalDZ = 0;
-        if (Math.abs(targetDZ) > 0.0001) {
-            if (canPlayerMoveTo(p1, p1LastPos.x + finalDX, p1LastPos.z + targetDZ) &&
-                canPlayerMoveTo(p2, p2LastPos.x + finalDX, p2LastPos.z + targetDZ)) {
-                finalDZ = targetDZ;
+        double finalOffsetZ = sharedOffsetZ;
+        if (Math.abs(targetDZ) > 0.00001) {
+            if (canPlayerMoveTo(p1, overworldSpawn.x + finalOffsetX, overworldSpawn.z + tryNextOffsetZ) &&
+                canPlayerMoveTo(p2, netherSpawn.x + finalOffsetX, netherSpawn.z + tryNextOffsetZ)) {
+                finalOffsetZ = tryNextOffsetZ;
             }
         }
 
-        double targetP1X = p1LastPos.x + finalDX;
-        double targetP1Z = p1LastPos.z + finalDZ;
+        // 4. 更新绝对唯一的基准偏移量
+        sharedOffsetX = finalOffsetX;
+        sharedOffsetZ = finalOffsetZ;
 
-        double targetP2X = p2LastPos.x + finalDX;
-        double targetP2Z = p2LastPos.z + finalDZ;
+        // 5. 由全局唯一偏移量计算出两名玩家应该在的绝对位置，强行绑定同步！
+        double targetP1X = overworldSpawn.x + sharedOffsetX;
+        double targetP1Z = overworldSpawn.z + sharedOffsetZ;
 
-        // 3. 水平位置同步
-        syncHorizontalPosition(p1, targetP1X, targetP1Z, p1Cur);
-        syncHorizontalPosition(p2, targetP2X, targetP2Z, p2Cur);
+        double targetP2X = netherSpawn.x + sharedOffsetX;
+        double targetP2Z = netherSpawn.z + sharedOffsetZ;
 
-        p1LastPos = p1.getPos();
-        p2LastPos = p2.getPos();
+        syncHorizontalPosition(p1, targetP1X, targetP1Z);
+        syncHorizontalPosition(p2, targetP2X, targetP2Z);
     }
 
-    // 精准实体墙壁碰撞检测
     private boolean canPlayerMoveTo(ServerPlayerEntity player, double targetX, double targetZ) {
         ServerWorld world = player.getServerWorld();
         double currentY = player.getY();
@@ -257,21 +264,21 @@ public class DualSyncMod implements ModInitializer {
         return world.isSpaceEmpty(player, testBox);
     }
 
-    // 终极视角与坐标同步：使用玩家真实视角 + 空 Flag 集合，彻底解决 0 0 视角重置问题
-    private void syncHorizontalPosition(ServerPlayerEntity player, double targetX, double targetZ, Vec3d currentPos) {
-        double dx = targetX - currentPos.x;
-        double dz = targetZ - currentPos.z;
+    // 绝对防漂移同步：只要偏离唯一基准线，就立刻修正
+    private void syncHorizontalPosition(ServerPlayerEntity player, double targetX, double targetZ) {
+        double dx = targetX - player.getX();
+        double dz = targetZ - player.getZ();
         double distSq = dx * dx + dz * dz;
 
-        // 仅在水平位置偏差大于 0.0001 (约 1 厘米) 时进行强行修正，消除浮点误差并防止高频封包轰炸
-        if (distSq > 0.0001) {
+        // 极其灵敏的微米级修正，保证玩家即使高速持续移动也丝滑贴合基准线
+        if (distSq > 0.000001) {
             player.networkHandler.requestTeleport(
                 targetX,
-                player.getY(),                      // 保持玩家当前真实的 Y 坐标（不干扰重力下落与跳跃）
+                player.getY(),
                 targetZ,
-                player.getYaw(),                    // 读取服务端当前记录的玩家真实 Yaw 视角
-                player.getPitch(),                  // 读取服务端当前记录的玩家真实 Pitch 视角
-                EnumSet.noneOf(PositionFlag.class)  // 使用绝对坐标传输，彻底废弃易引发客户端位掩码 Bug 的相对 Flag
+                player.getYaw(),
+                player.getPitch(),
+                EnumSet.noneOf(PositionFlag.class)
             );
         }
     }
@@ -305,8 +312,9 @@ public class DualSyncMod implements ModInitializer {
         p1.getHungerManager().setFoodLevel(20);
         p2.getHungerManager().setFoodLevel(20);
 
-        p1LastPos = overworldSpawn;
-        p2LastPos = netherSpawn;
+        // 重置时清零偏移量
+        sharedOffsetX = 0.0;
+        sharedOffsetZ = 0.0;
 
         needsReset = false;
 
