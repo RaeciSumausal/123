@@ -8,7 +8,7 @@ import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
 import net.fabricmc.fabric.api.entity.event.v1.ServerPlayerEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
-import net.minecraft.block.BlockState;
+import net.minecraft.network.packet.s2c.play.PositionFlag;
 import net.minecraft.network.packet.s2c.play.SubtitleS2CPacket;
 import net.minecraft.network.packet.s2c.play.TitleFadeS2CPacket;
 import net.minecraft.network.packet.s2c.play.TitleS2CPacket;
@@ -26,6 +26,7 @@ import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.World;
 
+import java.util.EnumSet;
 import java.util.UUID;
 
 public class DualSyncMod implements ModInitializer {
@@ -67,7 +68,7 @@ public class DualSyncMod implements ModInitializer {
             }
         });
 
-        // 4. 注册复活监听 (强制回溯下界/主世界起跑点并恢复同步)
+        // 4. 注册复活监听 (精准回溯下界/主世界起跑点并恢复同步)
         ServerPlayerEvents.AFTER_RESPAWN.register((oldPlayer, newPlayer, alive) -> {
             if (gameActive && (newPlayer.getUuid().equals(p1UUID) || newPlayer.getUuid().equals(p2UUID))) {
                 onPlayerRespawn(newPlayer.getServer());
@@ -95,7 +96,7 @@ public class DualSyncMod implements ModInitializer {
                     netherSpawn = new Vec3d(x, netherY, z);
                     customSpawnSet = true;
 
-                    ctx.getSource().sendFeedback(() -> Text.literal("§a[DualSync] 成功设置自定义坐标！\n" +
+                    ctx.getSource().sendFeedback(() -> Text.literal("§a[DualSync] 成功设置起跑坐标！\n" +
                             "主世界: (" + x + ", " + owY + ", " + z + ")\n" +
                             "下界: (" + x + ", " + netherY + ", " + z + ")"), true);
                     return 1;
@@ -107,7 +108,7 @@ public class DualSyncMod implements ModInitializer {
                     overworldSpawn = null;
                     netherSpawn = null;
                     customSpawnSet = false;
-                    ctx.getSource().sendFeedback(() -> Text.literal("§e[DualSync] 已清空预设起跑坐标！开启游戏时将自动选取安全区域。"), true);
+                    ctx.getSource().sendFeedback(() -> Text.literal("§e[DualSync] 已清空起跑坐标，启动前请重新设置！"), true);
                     return 1;
                 }))
 
@@ -116,6 +117,12 @@ public class DualSyncMod implements ModInitializer {
                 .then(CommandManager.argument("p1", StringArgumentType.string())
                 .then(CommandManager.argument("p2", StringArgumentType.string())
                 .executes(ctx -> {
+                    // 问题 1 修复：未设置坐标时不再自动寻找，提示必须手动设置
+                    if (!customSpawnSet || overworldSpawn == null || netherSpawn == null) {
+                        ctx.getSource().sendError(Text.literal("§c[DualSync] 错误：尚未设置坐标！请先使用 /dualsync setspawn <x> <owY> <netherY> <z> 设置。"));
+                        return 0;
+                    }
+
                     String p1Name = StringArgumentType.getString(ctx, "p1");
                     String p2Name = StringArgumentType.getString(ctx, "p2");
 
@@ -124,7 +131,7 @@ public class DualSyncMod implements ModInitializer {
                     ServerPlayerEntity p2 = server.getPlayerManager().getPlayer(p2Name);
 
                     if (p1 == null || p2 == null) {
-                        ctx.getSource().sendError(Text.literal("[DualSync] 错误：找不到指定玩家，请确认两人均在服内！"));
+                        ctx.getSource().sendError(Text.literal("§c[DualSync] 错误：找不到指定玩家，请确认两人均在线！"));
                         return 0;
                     }
 
@@ -152,25 +159,19 @@ public class DualSyncMod implements ModInitializer {
         ServerWorld overworld = server.getWorld(World.OVERWORLD);
         ServerWorld nether = server.getWorld(World.NETHER);
 
-        // 若未手动设置坐标，自动寻找安全位置
-        if (!customSpawnSet || overworldSpawn == null || netherSpawn == null) {
-            overworldSpawn = findSafeSpawn(overworld, p1.getBlockPos());
-            netherSpawn = findSafeSpawn(nether, p2.getBlockPos());
-            source.sendFeedback(() -> Text.literal("§e[DualSync] 未设置坐标，已自动选择安全起跑点！"), false);
-        }
-
         // 传送至起跑点
         p1.teleport(overworld, overworldSpawn.x, overworldSpawn.y, overworldSpawn.z, p1.getYaw(), p1.getPitch());
         p2.teleport(nether, netherSpawn.x, netherSpawn.y, netherSpawn.z, p2.getYaw(), p2.getPitch());
 
-        p1StartPos = p1.getPos();
-        p2StartPos = p2.getPos();
-        p1StartDimension = p1.getWorld().getRegistryKey();
-        p2StartDimension = p2.getWorld().getRegistryKey();
+        // 问题 3 修复：直接锚定设置的坐标，确保 100% 精确
+        p1StartPos = overworldSpawn;
+        p2StartPos = netherSpawn;
+
+        p1StartDimension = World.OVERWORLD;
+        p2StartDimension = World.NETHER;
 
         gameActive = true;
 
-        // 音效与文字标题效果
         sendTitleAndSound(p1, "§a§l双界同步 · 开始", "§7保持同步，跨越维度！", SoundEvents.UI_TOAST_CHALLENGE_COMPLETE);
         sendTitleAndSound(p2, "§a§l双界同步 · 开始", "§7保持同步，跨越维度！", SoundEvents.UI_TOAST_CHALLENGE_COMPLETE);
 
@@ -187,7 +188,7 @@ public class DualSyncMod implements ModInitializer {
             return;
         }
 
-        // 检测跨越维度触发胜利
+        // 维度跨越检测
         boolean p1Crossed = !p1.getWorld().getRegistryKey().equals(p1StartDimension);
         boolean p2Crossed = !p2.getWorld().getRegistryKey().equals(p2StartDimension);
 
@@ -196,29 +197,56 @@ public class DualSyncMod implements ModInitializer {
             return;
         }
 
-        // 位置同步与重力下落处理
+        // 计算 P1 位移并应用给 P2
         Vec3d delta1 = p1.getPos().subtract(p1StartPos);
-        Vec3d targetP2Pos = p2StartPos.add(delta1);
+        double targetX = p2StartPos.x + delta1.x;
+        double targetY = p2StartPos.y + delta1.y;
+        double targetZ = p2StartPos.z + delta1.z;
 
-        updatePlayerPositionWithGravity(p2, targetP2Pos);
+        // 问题 4 修复：平滑移动、防穿墙、不卡视角、空中下落
+        syncP2Position(p2, targetX, targetY, targetZ);
     }
 
-    private void updatePlayerPositionWithGravity(ServerPlayerEntity player, Vec3d targetPos) {
-        ServerWorld world = player.getServerWorld();
-        BlockPos targetBlock = BlockPos.ofFloored(targetPos);
-        
-        // 检查目标位置脚下是否有方块
-        boolean hasGroundBelow = !world.getBlockState(targetBlock.down()).isAir();
+    private void syncP2Position(ServerPlayerEntity p2, double targetX, double targetY, double targetZ) {
+        ServerWorld world = p2.getServerWorld();
 
-        // 传送基本坐标
-        player.teleport(world, targetPos.x, targetPos.y, targetPos.z, player.getYaw(), player.getPitch());
+        // 1. 防穿墙检测
+        BlockPos feetPos = BlockPos.ofFloored(targetX, targetY + 0.1, targetZ);
+        BlockPos headPos = BlockPos.ofFloored(targetX, targetY + 1.5, targetZ);
 
-        // 如果玩家悬空且没有飞行能力，则保留下落速度，避免在空中平移浮空
-        if (!hasGroundBelow && !player.isOnGround() && !player.isFallFlying() && !player.getAbilities().flying) {
-            double fallVel = player.getVelocity().y < 0 ? player.getVelocity().y : -0.08;
-            player.setVelocity(player.getVelocity().x, fallVel, player.getVelocity().z);
-            player.velocityModified = true;
+        boolean feetInWall = world.getBlockState(feetPos).isOpaqueFullCube(world, feetPos);
+        boolean headInWall = world.getBlockState(headPos).isOpaqueFullCube(world, headPos);
+
+        double finalX = targetX;
+        double finalY = targetY;
+        double finalZ = targetZ;
+
+        if (feetInWall || headInWall) {
+            // 如果前方是墙，限制 X/Z 轴盲目穿墙
+            finalX = p2.getX();
+            finalZ = p2.getZ();
         }
+
+        // 2. 空中下落检测（解决空中悬浮问题）
+        BlockPos groundCheck = BlockPos.ofFloored(finalX, finalY - 0.1, finalZ);
+        boolean isAirBelow = world.getBlockState(groundCheck).isAir();
+
+        if (isAirBelow && !p2.isOnGround()) {
+            // 如果脚下是空气，保留自由下落 Y 轴，不强制锁定高度
+            if (p2.getY() < finalY) {
+                finalY = p2.getY();
+            }
+        }
+
+        // 3. 使用 Relative Rotation Flags 传送，彻底解放视角控制
+        p2.networkHandler.requestTeleport(
+            finalX, 
+            finalY, 
+            finalZ, 
+            0, 
+            0, 
+            EnumSet.of(PositionFlag.X_ROT, PositionFlag.Y_ROT)
+        );
     }
 
     private void onPlayerDeath(MinecraftServer server) {
@@ -227,9 +255,9 @@ public class DualSyncMod implements ModInitializer {
         ServerPlayerEntity p1 = server.getPlayerManager().getPlayer(p1UUID);
         ServerPlayerEntity p2 = server.getPlayerManager().getPlayer(p2UUID);
 
-        // 音效与标题：死亡提示
-        if (p1 != null) sendTitleAndSound(p1, "§c§l挑战失败", "§7一名玩家已阵亡，即将重置...", SoundEvents.ENTITY_WITHER_DEATH);
-        if (p2 != null) sendTitleAndSound(p2, "§c§l挑战失败", "§7一名玩家已阵亡，即将重置...", SoundEvents.ENTITY_WITHER_DEATH);
+        // 问题 2 修复：不再提示“挑战失败”，改为“触发重置”
+        if (p1 != null) sendTitleAndSound(p1, "§c§l触发重置", "§7检测到玩家阵亡，正在重新开始...", SoundEvents.ENTITY_WITHER_DEATH);
+        if (p2 != null) sendTitleAndSound(p2, "§c§l触发重置", "§7检测到玩家阵亡，正在重新开始...", SoundEvents.ENTITY_WITHER_DEATH);
     }
 
     private void onPlayerRespawn(MinecraftServer server) {
@@ -243,7 +271,7 @@ public class DualSyncMod implements ModInitializer {
         ServerWorld overworld = server.getWorld(World.OVERWORLD);
         ServerWorld nether = server.getWorld(World.NETHER);
 
-        // 分别送回主世界与下界，重置状态与锚点
+        // 问题 3 修复：复活时强行送回精确起跑点
         p1.teleport(overworld, overworldSpawn.x, overworldSpawn.y, overworldSpawn.z, p1.getYaw(), p1.getPitch());
         p2.teleport(nether, netherSpawn.x, netherSpawn.y, netherSpawn.z, p2.getYaw(), p2.getPitch());
 
@@ -252,11 +280,10 @@ public class DualSyncMod implements ModInitializer {
         p1.getHungerManager().setFoodLevel(20);
         p2.getHungerManager().setFoodLevel(20);
 
-        // 重新设定起点基准
-        p1StartPos = p1.getPos();
-        p2StartPos = p2.getPos();
+        // 重新锚定起点基准
+        p1StartPos = overworldSpawn;
+        p2StartPos = netherSpawn;
 
-        // 恢复后音效与标题
         sendTitleAndSound(p1, "§e§l重新开始！", "§7已重置到起点，保持步调一致！", SoundEvents.ENTITY_PLAYER_LEVELUP);
         sendTitleAndSound(p2, "§e§l重新开始！", "§7已重置到起点，保持步调一致！", SoundEvents.ENTITY_PLAYER_LEVELUP);
     }
@@ -264,7 +291,6 @@ public class DualSyncMod implements ModInitializer {
     private void triggerVictory(MinecraftServer server, ServerPlayerEntity p1, ServerPlayerEntity p2) {
         gameActive = false;
 
-        // 通关音效与全屏标题
         sendTitleAndSound(p1, "§6§l🎉 挑战成功！", "§a你们成功打破空间藩篱，完成了双界同步！", SoundEvents.UI_TOAST_CHALLENGE_COMPLETE);
         sendTitleAndSound(p2, "§6§l🎉 挑战成功！", "§a你们成功打破空间藩篱，完成了双界同步！", SoundEvents.UI_TOAST_CHALLENGE_COMPLETE);
 
@@ -276,23 +302,6 @@ public class DualSyncMod implements ModInitializer {
         broadcast(server, "§c[DualSync] 游戏已终止：" + reason);
     }
 
-    // 自动寻找安全地面算法
-    private Vec3d findSafeSpawn(ServerWorld world, BlockPos origin) {
-        BlockPos.Mutable mutable = origin.mutableCopy();
-        for (int y = origin.getY(); y > world.getBottomY() + 5; y--) {
-            mutable.setY(y);
-            BlockState block = world.getBlockState(mutable);
-            BlockState above1 = world.getBlockState(mutable.up());
-            BlockState above2 = world.getBlockState(mutable.up(2));
-
-            if (!block.isAir() && block.isOpaque() && above1.isAir() && above2.isAir()) {
-                return new Vec3d(mutable.getX() + 0.5, mutable.getY() + 1.0, mutable.getZ() + 0.5);
-            }
-        }
-        return new Vec3d(origin.getX() + 0.5, origin.getY(), origin.getZ() + 0.5);
-    }
-
-    // 发送大标题 + 音效工具类
     private void sendTitleAndSound(ServerPlayerEntity player, String title, String subtitle, SoundEvent sound) {
         player.networkHandler.sendPacket(new TitleFadeS2CPacket(10, 70, 20));
         if (title != null) {
