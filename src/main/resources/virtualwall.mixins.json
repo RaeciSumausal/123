@@ -1,0 +1,14 @@
+{
+  "required": true,
+  "package": "net.fabricmc.virtualwall.mixin",
+  "compatibilityLevel": "JAVA_17",
+  "mixins": [
+    "EntityCollisionMixin"
+  ],
+  "client": [
+    "KeyboardInputMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
